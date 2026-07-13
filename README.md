@@ -37,14 +37,14 @@ where you cloned the repo):
 {
   "mcpServers": {
     "onenote": {
-      "command": "C:\\Projects\\Personal\\OneNoteSpike\\.venv\\Scripts\\python.exe",
+      "command": "C:\\Projects\\onenote-mcp\\.venv\\Scripts\\python.exe",
       "args": ["-m", "onenote_mcp.server"]
     }
   }
 }
 ```
 
-Alternatively, installation creates a console script, so `command` can simply be `".venv\\Scripts\\onenote-mcp.exe"` with no `args` at all.
+Alternatively, installation creates a console script, so `command` can simply be the absolute path to `".venv\\Scripts\\onenote-mcp.exe"` inside the repo, with no `args` at all (relative paths won't work — Claude Desktop does not launch servers from the repo directory).
 
 Restart Claude Desktop; the OneNote tools should appear in the tools list.
 OneNote desktop must be running (or startable) with at least one notebook open.
@@ -57,6 +57,8 @@ Install straight from GitHub into a fresh venv:
 py -m venv %USERPROFILE%\onenote-mcp
 %USERPROFILE%\onenote-mcp\Scripts\python.exe -m pip install git+https://github.com/noelroehrig/onenote-mcp
 ```
+
+(cmd syntax — in PowerShell write `$env:USERPROFILE` instead of `%USERPROFILE%`.)
 
 Then point Claude Desktop at the installed console script. On a machine with production onenote notebooks, restrict the server to a dedicated notebook right away:
 
