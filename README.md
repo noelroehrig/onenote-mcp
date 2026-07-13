@@ -44,24 +44,21 @@ where you cloned the repo):
 }
 ```
 
-Alternatively, installation creates a console script, so `command` can simply be
-`"C:\\Projects\\Personal\\OneNoteSpike\\.venv\\Scripts\\onenote-mcp.exe"` with no
-`args` at all.
+Alternatively, installation creates a console script, so `command` can simply be `".venv\\Scripts\\onenote-mcp.exe"` with no `args` at all.
 
 Restart Claude Desktop; the OneNote tools should appear in the tools list.
 OneNote desktop must be running (or startable) with at least one notebook open.
 
-## Installing on another machine
+## Installing as an executable
 
-No clone needed — install straight from GitHub into a fresh venv:
+Install straight from GitHub into a fresh venv:
 
 ```
 py -m venv %USERPROFILE%\onenote-mcp
 %USERPROFILE%\onenote-mcp\Scripts\python.exe -m pip install git+https://github.com/noelroehrig/onenote-mcp
 ```
 
-Then point Claude Desktop at the installed console script. On a machine that
-isn't yours, restrict the server to a dedicated notebook right away:
+Then point Claude Desktop at the installed console script. On a machine with production onenote notebooks, restrict the server to a dedicated notebook right away:
 
 ```json
 {
@@ -85,47 +82,47 @@ the desktop edition (2016 or Microsoft 365) is required.
 
 ### Navigation
 
-| Tool | What it does |
-|------|--------------|
+| Tool            | What it does                                                                   |
+| --------------- | ------------------------------------------------------------------------------ |
 | `get_notebooks` | Open notebooks with their sections (no pages) — the small navigation skeleton. |
-| `list_pages` | The pages of one section as `{id, name}` pairs. |
+| `list_pages`    | The pages of one section as `{id, name}` pairs.                                |
 
 The intended flow: `get_notebooks` → pick a section → `list_pages(section_id)` →
 pick a page → read/write tools below.
 
 ### Reading
 
-| Tool | What it does |
-|------|--------------|
-| `get_page` | A page as structured JSON: paragraphs, headings, lists, inline and floating images. Image bytes are **not** included — images carry compact `mcpref:` handles instead. |
-| `get_image_data` | The base64 bytes for a single image handle, fetched on demand. |
-| `validate_handles` | Check whether image handles are still writable, without writing anything. |
+| Tool               | What it does                                                                                                                                                           |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_page`         | A page as structured JSON: paragraphs, headings, lists, inline and floating images. Image bytes are **not** included — images carry compact `mcpref:` handles instead. |
+| `get_image_data`   | The base64 bytes for a single image handle, fetched on demand.                                                                                                         |
+| `validate_handles` | Check whether image handles are still writable, without writing anything.                                                                                              |
 
 ### Writing
 
-| Tool | What it does |
-|------|--------------|
-| `create_page` | Create a page in a section; optionally as a sub-page of an existing page. Returns the new page id. |
-| `replace_page` | Replace a page's entire content from structured JSON (outlines + floating images). |
-| `append_page` | Append one structured content block to an existing page, preserving current content. |
+| Tool           | What it does                                                                                       |
+| -------------- | -------------------------------------------------------------------------------------------------- |
+| `create_page`  | Create a page in a section; optionally as a sub-page of an existing page. Returns the new page id. |
+| `replace_page` | Replace a page's entire content from structured JSON (outlines + floating images).                 |
+| `append_page`  | Append one structured content block to an existing page, preserving current content.               |
 
 ### Health
 
-| Tool | What it does |
-|------|--------------|
+| Tool   | What it does                                                                                                                   |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------ |
 | `ping` | Fast health check: is the server alive, and is OneNote responding? Works even while another call is stuck on a wedged OneNote. |
 
 ### Raw-XML escape hatches
 
-Prefer the structured tools above; these exist for direct schema control and
-debugging.
+Prefer the structured tools above; these exist for direct schema control and debugging.
+Token usage is significantly higher with the whole XML-overhead.
 
-| Tool | What it does |
-|------|--------------|
+| Tool                 | What it does                                                                      |
+| -------------------- | --------------------------------------------------------------------------------- |
 | `list_hierarchy_xml` | The entire notebook → section → page tree as raw OneNote XML (can be very large). |
-| `get_page_xml` | The full `<one:Page>` XML of a page, with images as `mcpref:` handles. |
-| `replace_page_xml` | Replace a page from a caller-supplied `<one:Page>` document. |
-| `append_page_xml` | Append a single raw XML element (e.g. `<one:Outline>`) to a page. |
+| `get_page_xml`       | The full `<one:Page>` XML of a page, with images as `mcpref:` handles.            |
+| `replace_page_xml`   | Replace a page from a caller-supplied `<one:Page>` document.                      |
+| `append_page_xml`    | Append a single raw XML element (e.g. `<one:Outline>`) to a page.                 |
 
 ## Image handles (`mcpref:`)
 
@@ -143,27 +140,26 @@ position. This keeps reads of image-heavy pages small and fast.
 
 ## Error codes
 
-Tool errors start with a machine-readable code so clients can react without
-parsing prose:
+Tool errors start with a machine-readable code so clients can react without parsing prose:
 
-| Code | Meaning |
-|------|---------|
-| `timeout` | OneNote did not respond within the per-operation deadline — it is likely showing a modal dialog or syncing. Dismiss any dialog and retry; `ping` tells you when it has recovered. |
-| `backend_error` | OneNote returned a COM failure (bad id, locked content, …). |
-| `bad_request` | The request itself was invalid (unknown image handle, malformed content, …). |
+| Code            | Meaning                                                                                                                                                                           |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout`       | OneNote did not respond within the per-operation deadline — it is likely showing a modal dialog or syncing. Dismiss any dialog and retry; `ping` tells you when it has recovered. |
+| `backend_error` | OneNote returned a COM failure (bad id, locked content, …).                                                                                                                       |
+| `bad_request`   | The request itself was invalid (unknown image handle, malformed content, …).                                                                                                      |
 
 ## Configuration
 
 All configuration is via environment variables (set them in the `env` block of
 the Claude Desktop server entry if needed):
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `ONENOTE_ALLOWED_NOTEBOOKS` | *(unset — no restriction)* | Comma-separated notebook names, e.g. `ClaudeSpike, Mathe 5a`. When set, all other notebooks are invisible and untouchable: they are hidden from notebook listings and every read/write against their sections or pages is rejected. |
-| `ONENOTE_READ_TIMEOUT` | `20` | Timeout (s) for page/hierarchy reads and image fetches |
-| `ONENOTE_WRITE_TIMEOUT` | `25` | Timeout (s) for page creates and writes |
-| `ONENOTE_PING_TIMEOUT` | `8` | Timeout (s) for the `ping` health probe |
-| `ONENOTE_IMAGE_CACHE_MB` | `200` | In-memory cap for cached image bytes; least-recently-used entries are evicted beyond it |
+| Variable                    | Default                    | Meaning                                                                                                                                                                                                                             |
+| --------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ONENOTE_ALLOWED_NOTEBOOKS` | _(unset — no restriction)_ | Comma-separated notebook names, e.g. `ClaudeSpike, Mathe 5a`. When set, all other notebooks are invisible and untouchable: they are hidden from notebook listings and every read/write against their sections or pages is rejected. |
+| `ONENOTE_READ_TIMEOUT`      | `20`                       | Timeout (s) for page/hierarchy reads and image fetches                                                                                                                                                                              |
+| `ONENOTE_WRITE_TIMEOUT`     | `25`                       | Timeout (s) for page creates and writes                                                                                                                                                                                             |
+| `ONENOTE_PING_TIMEOUT`      | `8`                        | Timeout (s) for the `ping` health probe                                                                                                                                                                                             |
+| `ONENOTE_IMAGE_CACHE_MB`    | `200`                      | In-memory cap for cached image bytes; least-recently-used entries are evicted beyond it                                                                                                                                             |
 
 ## Development
 
