@@ -19,7 +19,79 @@ I hope this helps someone in a similar situation like me! Feel free to use the c
 
 - Windows 10/11
 - OneNote desktop (2013, 2016, or Microsoft 365)
-- Python 3.10+
+- Python 3.10+ (not needed for the [standalone executable](#standalone-executable))
+
+## Standalone executable
+
+Every [GitHub release](https://github.com/noelroehrig/onenote-mcp/releases) ships a
+self-contained `onenote-mcp.exe` that needs no Python installation. The asset names
+stay the same across releases; the version is the release tag.
+
+- Executable: <https://github.com/noelroehrig/onenote-mcp/releases/latest/download/onenote-mcp.exe>
+- Checksum: <https://github.com/noelroehrig/onenote-mcp/releases/latest/download/onenote-mcp.exe.sha256>
+
+The exe needs the OneNote desktop edition, not the Microsoft Store "OneNote for Windows 10" app.
+
+### Verify the checksum
+
+In PowerShell, in the download folder (prints `True` when the file is intact):
+
+```powershell
+(Get-FileHash onenote-mcp.exe -Algorithm SHA256).Hash -eq (Get-Content onenote-mcp.exe.sha256).Split(' ')[0]
+```
+
+The `.sha256` file uses the `sha256sum` format, so `sha256sum -c onenote-mcp.exe.sha256`
+works as well (e.g. in Git Bash).
+
+### Claude Desktop configuration for the exe
+
+Move the exe to a permanent location, e.g. `%LOCALAPPDATA%\onenote-mcp\`, and point
+`%APPDATA%\Claude\claude_desktop_config.json` at it:
+
+```json
+{
+  "mcpServers": {
+    "onenote": {
+      "command": "C:\\Users\\<name>\\AppData\\Local\\onenote-mcp\\onenote-mcp.exe",
+      "env": { "ONENOTE_ALLOWED_NOTEBOOKS": "SharedNotebook" }
+    }
+  }
+}
+```
+
+`ONENOTE_ALLOWED_NOTEBOOKS` limits the server to the listed notebooks; see
+[Configuration](#configuration) for all options. Restart Claude Desktop and ask Claude
+to call `ping`: `{"server": "ok", "onenote_responsive": true}` means the exe and
+OneNote are talking to each other.
+
+### Why a single file, and what it costs
+
+The exe is a PyInstaller `--onefile` build because a single file is the easiest thing
+to download, verify and reference from a config. A `--onedir` build starts faster and
+usually trips antivirus less often, but it is a folder with the whole Python runtime
+that has to be unzipped and kept together. The single file costs:
+
+- **Startup time.** Every launch unpacks the bundled runtime into a temporary
+  `%TEMP%\_MEI*` folder, which is removed on exit. The server answers after about
+  1.5 s instead of about 0.7 s from a venv, and the first launch after a download can
+  take longer while antivirus scans the file. Claude Desktop starts the server once
+  per session, so this is paid once.
+- **Antivirus false positives.** Self-extracting PyInstaller executables are a common
+  antivirus false positive, and this exe is not code-signed. If your scanner
+  quarantines it, check the SHA256 before allowing it, and consider reporting the false
+  positive to the vendor. Windows SmartScreen may also warn about an unrecognized app
+  when you start the exe from Explorer.
+
+### COM inside the exe
+
+comtypes generates Python wrappers for OneNote's COM type library the first time the
+server connects to OneNote. The packages bundled in the exe are read-only, so comtypes
+writes the wrappers to `%TEMP%\comtypes_cache\onenote-mcp-314` instead (the suffix is
+the bundled Python version) and reuses them on later launches. They cannot be
+generated at build time: the type library ships inside `ONENOTE.EXE`, which the build
+machine does not have. In the exe, comtypes does not check whether the type library
+changed, so if OneNote calls start failing after an Office update, delete that folder
+and the wrappers are regenerated on the next start.
 
 ## Installation
 
@@ -196,6 +268,31 @@ notebook in OneNote first (they fall back to the first open notebook otherwise):
 ```
 .venv\Scripts\python.exe -m pytest -m e2e tests/e2e/ -v
 ```
+
+### Releases and the standalone exe
+
+`.github/workflows/release.yml` runs the unit tests, builds `onenote-mcp.exe` and
+smoke-tests it. On a pushed `v*` tag it then publishes a GitHub release with the exe
+and its checksum; a manual run (`workflow_dispatch`) stops after the smoke test and
+keeps the exe as a workflow artifact for one day.
+
+To release, set `version` in `pyproject.toml` and push the matching tag, e.g. `v1.0.1`
+for `1.0.1`. The build fails if the two differ.
+
+To build locally, use a fresh venv so the build matches CI, with the PyInstaller
+version pinned in the workflow:
+
+```
+py -m venv %TEMP%\onenote-mcp-build
+%TEMP%\onenote-mcp-build\Scripts\python.exe -m pip install . pyinstaller==6.22.3
+%TEMP%\onenote-mcp-build\Scripts\python.exe -m PyInstaller packaging/onenote-mcp.spec --noconfirm --clean
+%TEMP%\onenote-mcp-build\Scripts\python.exe packaging/smoke_test.py dist/onenote-mcp.exe --require-onenote
+```
+
+The smoke test speaks MCP over stdio to the exe: it checks that the exe exposes the
+same tools as the source and that `ping` answers. `--require-onenote` additionally
+requires a responsive OneNote and a working `get_notebooks`; CI runs without it
+because the runner has no OneNote.
 
 ## License
 
