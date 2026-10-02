@@ -101,9 +101,19 @@ def _discover_onenote_exe() -> str:
       bare:          C:\\...\\ONENOTE.EXE
       quoted:        "C:\\...\\ONENOTE.EXE"
       quoted + args: "C:\\...\\ONENOTE.EXE" /something
+
+    Raises OneNoteError when the key is missing, i.e. OneNote desktop is not
+    installed (the Store app registers no COM server).
     """
-    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, _CLSID_LOCAL_SERVER) as key:
-        value, _ = winreg.QueryValueEx(key, None)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, _CLSID_LOCAL_SERVER) as key:
+            value, _ = winreg.QueryValueEx(key, None)
+    except FileNotFoundError as exc:
+        raise OneNoteError(
+            "OneNote desktop is not registered for COM automation. Install the "
+            "desktop edition (2016 or Microsoft 365); the Microsoft Store app "
+            "has no COM interface."
+        ) from exc
     value = value.strip()
     if value.startswith('"'):
         # Quoted path: "C:\...\ONENOTE.EXE" or "C:\...\ONENOTE.EXE" /args
