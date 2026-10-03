@@ -33,6 +33,7 @@ or blank means unrestricted.
 """
 
 import hashlib
+import html
 import os
 import sys
 import threading
@@ -651,7 +652,8 @@ def _create_page_impl(
         title_el = ET.SubElement(page_el, f"{{{_ONE_NS}}}Title")
         oe_el = ET.SubElement(title_el, f"{{{_ONE_NS}}}OE")
         t_el = ET.SubElement(oe_el, f"{{{_ONE_NS}}}T")
-        t_el.text = title
+        # OneNote reads <one:T> content as HTML.
+        t_el.text = html.escape(title, quote=False)
         title_xml = ET.tostring(page_el, encoding="unicode", xml_declaration=False)
         app.UpdatePageContent(title_xml, 0.0)
     if parent_page_id is not None:
@@ -757,8 +759,8 @@ def create_page(
     """Create a blank page in *section_id* and return its new page ID.
 
     If *title* is given, seeds the page with a <one:Title> element.
-    If *parent_page_id* is given, the new page is placed as a sub-page directly
-    under that page (reordered to sit after it, indented one level).
+    If *parent_page_id* is given, the new page becomes the last sub-page of that
+    page (placed after its existing sub-pages, indented one level).
     """
     try:
         return _run_com(

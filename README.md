@@ -189,7 +189,8 @@ pick a page → read/write tools below.
 ### Raw-XML escape hatches
 
 Prefer the structured tools above; these exist for direct schema control and debugging.
-Token usage is significantly higher with the whole XML-overhead.
+Token usage is significantly higher with the whole XML-overhead. Set
+[`ONENOTE_DISABLE_RAW_XML`](#configuration) to `1` to remove them from the server.
 
 | Tool                 | What it does                                                                      |
 | -------------------- | --------------------------------------------------------------------------------- |
@@ -234,6 +235,7 @@ the Claude Desktop server entry if needed):
 | `ONENOTE_WRITE_TIMEOUT`     | `25`                       | Timeout (s) for page creates and writes                                                                                                                                                                                             |
 | `ONENOTE_PING_TIMEOUT`      | `8`                        | Timeout (s) for the `ping` health probe                                                                                                                                                                                             |
 | `ONENOTE_IMAGE_CACHE_MB`    | `200`                      | In-memory cap for cached image bytes; least-recently-used entries are evicted beyond it                                                                                                                                             |
+| `ONENOTE_DISABLE_RAW_XML`   | _(unset: raw-XML tools on)_ | `1` or `true` (any case): the four raw-XML tools (`list_hierarchy_xml`, `get_page_xml`, `replace_page_xml`, `append_page_xml`) are not registered and do not appear in the tool list. Unset, empty, `0` or `false`: all tools are available. Any other value stops the server at startup with an error. Read once at startup. |
 
 ## Development
 
@@ -290,7 +292,9 @@ py -m venv %TEMP%\onenote-mcp-build
 ```
 
 The smoke test speaks MCP over stdio to the exe: it checks that the exe exposes the
-same tools as the source and that `ping` answers. `--require-onenote` additionally
+same tools as the source and that `ping` answers, then starts it again with
+`ONENOTE_DISABLE_RAW_XML=1` and checks for exactly the 9 tools without the raw-XML
+ones. `--require-onenote` additionally
 requires a responsive OneNote and a working `get_notebooks`; CI runs without it
 because the runner has no OneNote.
 

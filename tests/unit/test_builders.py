@@ -1096,3 +1096,144 @@ def test_roundtrip_inline_image():
     assert recovered.handle == "mcpref:abc123def456"
     assert recovered.width == 100.0
     assert recovered.height == 200.0
+
+
+# ---------------------------------------------------------------------------
+# Text escaping: OneNote reads <one:T> content as HTML, so text is escaped on
+# write and must come back unchanged from parse_page.
+# ---------------------------------------------------------------------------
+
+_SPECIAL_TEXTS = [
+    "a < b > c",
+    "Fish & Chips, &amp; and &lt;",
+    "<b>not bold</b>",
+    "ends a CDATA section ]]> early",
+    "\"double\" and 'single' quotes",
+    "Grüße aus Köln: äöü ÄÖÜ ß",
+]
+
+
+def _first_item(outline: Outline, title: str = "Doc"):
+    return parse_page(build_page_xml(title, [outline])).outlines[0].items[0]
+
+
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_plain_paragraph(text):
+    p = _first_item(Outline(items=[Paragraph(type="paragraph", text=text)]))
+    assert p.text == text
+    assert p.segments is None and p.bold is False
+
+
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_styled_paragraph(text):
+    para = Paragraph(type="paragraph", text=text, bold=True, color="#C00000", font_family="Courier New")
+    p = _first_item(Outline(items=[para]))
+    assert p.text == text
+    assert p.bold is True
+    assert p.color == "#C00000"
+    assert p.font_family == "Courier New"
+
+
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_heading(text):
+    p = _first_item(Outline(items=[Paragraph(type="paragraph", text=text, style="h1")]))
+    assert p.text == text
+
+
+@pytest.mark.parametrize("style", ["normal", "h2"])
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_segments(text, style):
+    segments = [TextRun(text=text), TextRun(text=text, italic=True)]
+    p = _first_item(Outline(items=[Paragraph(type="paragraph", segments=segments, style=style)]))
+    assert [s.text for s in p.segments] == [text, text]
+    assert p.segments[1].italic is True
+
+
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_list_items(text):
+    items = [ListItem(text=text), ListItem(segments=[TextRun(text=text, bold=True)])]
+    lst = _first_item(Outline(items=[List(type="list", style="bullet", items=items)]))
+    assert lst.items[0].text == text
+    assert lst.items[1].segments[0].text == text
+
+
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_title(text):
+    assert parse_page(build_page_xml(text, [])).title == text
+
+
+def test_special_text_round_trips_in_image_placeholder():
+    ph = ImagePlaceholder(type="image_placeholder", description="<b> & ]]>")
+    p = _first_item(Outline(items=[ph]))
+    assert p.text == "[INSERT IMAGE: <b> & ]]>]"
+
+
+def test_t_content_is_escaped_html():
+    """What OneNote receives: escaped text, wrapped in a span only when styled."""
+    text = "<b>x</b> & ]]>"
+    outline = Outline(items=[
+        Paragraph(type="paragraph", text=text),
+        Paragraph(type="paragraph", text=text, bold=True),
+    ])
+    root = ET.fromstring(build_page_xml("Doc", [outline]))
+    plain_t, styled_t = [
+        oe.find("one:T", _NS).text for oe in root.iterfind("one:Outline/one:OEChildren/one:OE", _NS)
+    ]
+    assert plain_t == "&lt;b&gt;x&lt;/b&gt; &amp; ]]&gt;"
+    assert styled_t == '<span style="font-weight:bold">&lt;b&gt;x&lt;/b&gt; &amp; ]]&gt;</span>'
+
+
+def test_cdata_terminator_only_closes_cdata_sections():
+    text = "ends ]]> early"
+    outline = Outline(items=[
+        Paragraph(type="paragraph", text=text),
+        Paragraph(type="paragraph", text=text, italic=True),
+        Paragraph(type="paragraph", segments=[TextRun(text=text, bold=True)]),
+        List(type="list", style="numbered", items=[ListItem(segments=[TextRun(text=text, bold=True)])]),
+        ImagePlaceholder(type="image_placeholder", description=text),
+    ])
+    xml = build_page_xml(text, [outline])
+    assert xml.count("<![CDATA[") == 4
+    assert xml.count("]]>") == xml.count("<![CDATA[")
+
+
+def test_apply_cdata_rejects_cdata_terminator():
+    with pytest.raises(ValueError, match=r"\]\]>"):
+        _apply_cdata("__CDATA_000000__", {0: "a ]]> b"})
+
+
+# ---------------------------------------------------------------------------
+# Style values read from OneNote are normalized to what the models accept
+# ---------------------------------------------------------------------------
+
+def _styled_paragraph(style: str, text: str = "styled") -> Paragraph:
+    xml = _page_xml(
+        '<one:Outline><one:OEChildren>'
+        f"  <one:OE><one:T><![CDATA[<span style='{style}'>{text}</span>]]></one:T></one:OE>"
+        '</one:OEChildren></one:Outline>'
+    )
+    return parse_page(xml).outlines[0].items[0]
+
+
+def test_parse_named_highlight_maps_to_hex():
+    p = _styled_paragraph("background:yellow;mso-highlight:yellow")
+    assert p.text == "styled"
+    assert p.highlight == "#FFFF00"
+
+
+def test_parse_unsupported_color_value_is_left_out():
+    p = _styled_paragraph("color:windowtext;font-weight:bold")
+    assert p.text == "styled"
+    assert p.color is None
+    assert p.bold is True
+
+
+def test_parse_quoted_font_family_is_unquoted():
+    p = _styled_paragraph('font-family:"Segoe UI",Arial')
+    assert p.font_family == "Segoe UI,Arial"
+
+
+def test_parse_unsupported_font_family_is_left_out():
+    p = _styled_paragraph("font-family:ＭＳ ゴシック")
+    assert p.text == "styled"
+    assert p.font_family is None

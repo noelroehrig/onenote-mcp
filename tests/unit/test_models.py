@@ -268,3 +268,47 @@ def test_inline_image_validates_handle_prefix():
     """InlineImage rejects handles that do not start with 'mcpref:'."""
     with pytest.raises(ValidationError):
         InlineImage(type="inline_image", handle="not-a-handle")
+
+
+# ---------------------------------------------------------------------------
+# Style values: restricted so they cannot break out of the style attribute
+# ---------------------------------------------------------------------------
+
+def _text_run(**fields):
+    return TextRun(text="x", **fields)
+
+
+def _paragraph(**fields):
+    return Paragraph(type="paragraph", text="x", **fields)
+
+
+@pytest.mark.parametrize("make", [_text_run, _paragraph])
+@pytest.mark.parametrize("field", ["color", "highlight"])
+@pytest.mark.parametrize("value", ["#abc", "#A1B2C3"])
+def test_hex_colors_accepted(make, field, value):
+    assert getattr(make(**{field: value}), field) == value
+
+
+@pytest.mark.parametrize("make", [_text_run, _paragraph])
+@pytest.mark.parametrize("field", ["color", "highlight"])
+@pytest.mark.parametrize("value", [
+    "red", "#abcd", "#12345", "#ggg", "abc", "#abc;font-size:99pt", '#abc" onclick="x', "#abc\n",
+])
+def test_invalid_colors_rejected(make, field, value):
+    with pytest.raises(ValidationError):
+        make(**{field: value})
+
+
+@pytest.mark.parametrize("make", [_text_run, _paragraph])
+@pytest.mark.parametrize("value", ["Courier New", "Segoe UI, Arial", "Font-1.0", "A" * 64])
+def test_font_family_accepted(make, value):
+    assert make(font_family=value).font_family == value
+
+
+@pytest.mark.parametrize("make", [_text_run, _paragraph])
+@pytest.mark.parametrize("value", [
+    "", "A" * 65, "Arial;color:red", '"Segoe UI"', "Arial'", "<b>", "Arial\n", "Courier_New",
+])
+def test_font_family_rejected(make, value):
+    with pytest.raises(ValidationError):
+        make(font_family=value)

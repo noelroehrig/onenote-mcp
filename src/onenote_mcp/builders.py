@@ -17,6 +17,7 @@ import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 
 from onenote_mcp.models import (
+    FONT_FAMILY_MAX_LENGTH, FONT_FAMILY_PATTERN, HEX_COLOR_PATTERN,
     ContentItem, FloatingImage, ImagePlaceholder, InlineImage, List, ListItem,
     Outline, PageContent, Paragraph, Position, TextRun,
 )
@@ -52,11 +53,41 @@ def _cdata_placeholder(index: int) -> str:
 
 def _apply_cdata(xml_str: str, cdata_map: dict[int, str]) -> str:
     for index, html in cdata_map.items():
+        if "]]>" in html:
+            raise ValueError(f"Markup must not contain ']]>', it would end the CDATA section: {html!r}")
         xml_str = xml_str.replace(_cdata_placeholder(index), f"<![CDATA[{html}]]>")
     return xml_str
 
 
+def _set_t_html(
+    t_el: ET.Element,
+    html: str,
+    cdata_map: dict[int, str],
+    cdata_counter: list[int],
+) -> None:
+    """Store an HTML fragment as the content of a <one:T>.
+
+    All text is escaped before it becomes HTML, so a '<' can only come from our
+    own span markup: such fragments go into a CDATA section, others stay plain.
+    """
+    if "<" not in html:
+        t_el.text = html
+        return
+    idx = cdata_counter[0]
+    cdata_counter[0] += 1
+    cdata_map[idx] = html
+    t_el.text = _cdata_placeholder(idx)
+
+
 # ---- Formatting → HTML ------------------------------------------------------
+
+def _escape_text(text: str) -> str:
+    """Escape text for <one:T>, whose content OneNote interprets as HTML.
+
+    Escaping '>' also guarantees that text can never produce ']]>'.
+    """
+    return _html_module.escape(text, quote=False)
+
 
 def _format_declarations(src: "TextRun | Paragraph") -> list[str]:
     """Return CSS declarations for any object carrying the shared formatting
@@ -85,10 +116,11 @@ def _format_declarations(src: "TextRun | Paragraph") -> list[str]:
 
 
 def _wrap_span(text: str, styles: list[str]) -> str:
-    """Wrap *text* in a styled <span>, or return it unchanged if no styles."""
+    """Return *text* escaped and wrapped in a styled <span>, or just escaped if no styles."""
+    escaped = _escape_text(text)
     if not styles:
-        return text
-    return f'<span style="{";".join(styles)}">{text}</span>'
+        return escaped
+    return f'<span style="{";".join(styles)}">{escaped}</span>'
 
 
 def _run_to_html(run: TextRun) -> str:
@@ -121,21 +153,10 @@ def _paragraph_to_oe(
         # Heading defaults first, then explicit paragraph-level fields so the
         # latter win (last value wins within a single style="" attribute).
         merged = heading_defaults + _format_declarations(p)
-        html = _wrap_span(p.text, merged)
-
-        if html == p.text:
-            t_el.text = p.text
-        else:
-            idx = cdata_counter[0]
-            cdata_counter[0] += 1
-            cdata_map[idx] = html
-            t_el.text = _cdata_placeholder(idx)
+        _set_t_html(t_el, _wrap_span(p.text, merged), cdata_map, cdata_counter)
 
     elif p.segments is not None:
-        plain_parts = [run.text for run in p.segments]
-        plain_text = "".join(plain_parts)
-        html_parts = [_run_to_html(run) for run in p.segments]
-        segments_html = "".join(html_parts)
+        segments_html = "".join(_run_to_html(run) for run in p.segments)
         if heading_defaults:
             # Wrap the segment HTML in an outer span carrying the heading
             # visual defaults.  Per-segment formatting is unaffected.
@@ -143,13 +164,7 @@ def _paragraph_to_oe(
             html = f'<span style="{style_str}">{segments_html}</span>'
         else:
             html = segments_html
-        if html == plain_text:
-            t_el.text = plain_text
-        else:
-            idx = cdata_counter[0]
-            cdata_counter[0] += 1
-            cdata_map[idx] = html
-            t_el.text = _cdata_placeholder(idx)
+        _set_t_html(t_el, html, cdata_map, cdata_counter)
 
     return oe
 
@@ -215,12 +230,9 @@ def _placeholder_to_oe(
     html = (
         f'<span style="background:#ffeb3b;color:#222;font-weight:bold;'
         f'padding:4px 8px;border:2px dashed #b07500;">'
-        f'[INSERT IMAGE: {ph.description}]</span>'
+        f'[INSERT IMAGE: {_escape_text(ph.description)}]</span>'
     )
-    idx = cdata_counter[0]
-    cdata_counter[0] += 1
-    cdata_map[idx] = html
-    t_el.text = _cdata_placeholder(idx)
+    _set_t_html(t_el, html, cdata_map, cdata_counter)
 
     return oe
 
@@ -268,19 +280,10 @@ def _list_items_to_oes(
         t_el = ET.SubElement(oe, f"{{{_ONE_NS}}}T")
 
         if item.text is not None:
-            t_el.text = item.text
+            t_el.text = _escape_text(item.text)
         elif item.segments is not None:
-            plain_parts = [run.text for run in item.segments]
-            plain_text = "".join(plain_parts)
-            html_parts = [_run_to_html(run) for run in item.segments]
-            html = "".join(html_parts)
-            if html == plain_text:
-                t_el.text = plain_text
-            else:
-                idx = cdata_counter[0]
-                cdata_counter[0] += 1
-                cdata_map[idx] = html
-                t_el.text = _cdata_placeholder(idx)
+            html = "".join(_run_to_html(run) for run in item.segments)
+            _set_t_html(t_el, html, cdata_map, cdata_counter)
 
         if item.children:
             oe_children = ET.SubElement(oe, f"{{{_ONE_NS}}}OEChildren")
@@ -383,7 +386,7 @@ def build_page_xml(title: str, outlines: list[Outline], images: list[FloatingIma
     title_el = ET.SubElement(root, f"{{{_ONE_NS}}}Title")
     title_oe = ET.SubElement(title_el, f"{{{_ONE_NS}}}OE")
     title_t = ET.SubElement(title_oe, f"{{{_ONE_NS}}}T")
-    title_t.text = title
+    title_t.text = _escape_text(title)
 
     for outline in outlines:
         root.append(_outline_to_el(outline, cdata_map, cdata_counter))
@@ -438,11 +441,38 @@ def _parse_pt(value: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
+# Basic CSS colour keywords (the names Office uses for highlights), mapped to
+# hex so colours read from OneNote validate as HexColor.
+_CSS_BASIC_COLORS: dict[str, str] = {
+    "black": "#000000", "silver": "#C0C0C0", "gray": "#808080", "white": "#FFFFFF",
+    "maroon": "#800000", "red": "#FF0000", "purple": "#800080", "fuchsia": "#FF00FF",
+    "green": "#008000", "lime": "#00FF00", "olive": "#808000", "yellow": "#FFFF00",
+    "navy": "#000080", "blue": "#0000FF", "teal": "#008080", "aqua": "#00FFFF",
+}
+
+
+def _slim_color(value: str) -> str | None:
+    """Return a CSS colour as '#RGB'/'#RRGGBB', or None if it has no such form."""
+    if re.fullmatch(HEX_COLOR_PATTERN, value):
+        return value
+    return _CSS_BASIC_COLORS.get(value.lower())
+
+
+def _slim_font_family(value: str) -> str | None:
+    """Return a CSS font-family list without quotes, or None if it does not fit FontFamily."""
+    family = value.replace('"', "").replace("'", "").strip()
+    if len(family) <= FONT_FAMILY_MAX_LENGTH and re.fullmatch(FONT_FAMILY_PATTERN, family):
+        return family
+    return None
+
+
 def _fmt_from_style(style_str: str) -> dict:
     """Translate a CSS ``style`` declaration string into slim formatting fields.
 
     Returns only the keys that are explicitly set, ready to splat into a
     TextRun/Paragraph (e.g. {"bold": True, "font_size": 16.0, "color": "#1E4E79"}).
+    Colour and font values the slim model cannot express are left out, like
+    any other unsupported CSS property.
     """
     fmt: dict = {}
     if not style_str:
@@ -463,15 +493,21 @@ def _fmt_from_style(style_str: str) -> dict:
         elif prop == "text-decoration":
             decoration += " " + val.lower()
         elif prop == "color":
-            fmt["color"] = val
+            color = _slim_color(val)
+            if color is not None:
+                fmt["color"] = color
         elif prop in ("background", "background-color"):
-            fmt["highlight"] = val
+            color = _slim_color(val)
+            if color is not None:
+                fmt["highlight"] = color
         elif prop == "font-size":
             pt = _parse_pt(val)
             if pt is not None:
                 fmt["font_size"] = pt
         elif prop == "font-family":
-            fmt["font_family"] = val
+            family = _slim_font_family(val)
+            if family is not None:
+                fmt["font_family"] = family
     if "underline" in decoration:
         fmt["underline"] = True
     if "line-through" in decoration:

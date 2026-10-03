@@ -24,6 +24,9 @@ Copy those handles verbatim into write XML — the server resolves them back to 
 """
 
 import asyncio
+import os
+import sys
+from collections.abc import Callable, Mapping
 
 from mcp.server.fastmcp import FastMCP
 
@@ -45,7 +48,16 @@ from onenote_mcp.builders import (
     build_page_xml, build_outline_xml, parse_notebook_skeleton, parse_section_pages, parse_page,
 )
 
-mcp = FastMCP("onenote")
+# Tool functions in definition order; create_server registers them.
+_TOOLS: list[tuple[Callable, bool]] = []
+
+
+def _tool(raw_xml: bool = False) -> Callable[[Callable], Callable]:
+    """Collect a tool function; raw_xml marks the *_xml escape hatches."""
+    def register(fn: Callable) -> Callable:
+        _TOOLS.append((fn, raw_xml))
+        return fn
+    return register
 
 
 def _fail(exc: Exception) -> ValueError:
@@ -64,7 +76,7 @@ def _fail(exc: Exception) -> ValueError:
     return ValueError(f"bad_request: {msg}")
 
 
-@mcp.tool()
+@_tool()
 async def ping() -> dict:
     """Fast health check — does NOT touch heavy page content.
 
@@ -84,7 +96,7 @@ async def ping() -> dict:
     return {"server": "ok", "onenote_responsive": responsive}
 
 
-@mcp.tool()
+@_tool()
 async def validate_handles(handles: list[str]) -> dict:
     """Check whether image handles can still be written back, without writing.
 
@@ -98,7 +110,7 @@ async def validate_handles(handles: list[str]) -> dict:
     return await asyncio.to_thread(_validate_handles_com, handles)
 
 
-@mcp.tool()
+@_tool()
 async def get_image_data(handle: str) -> str:
     """Fetch the raw base64 bytes for a single image handle, on demand.
 
@@ -116,7 +128,7 @@ async def get_image_data(handle: str) -> str:
         raise _fail(exc) from exc
 
 
-@mcp.tool()
+@_tool()
 async def get_notebooks() -> list[dict]:
     """Return open notebooks and their sections (no pages) — the navigation skeleton.
 
@@ -152,7 +164,7 @@ async def get_notebooks() -> list[dict]:
         raise _fail(exc) from exc
 
 
-@mcp.tool()
+@_tool()
 async def list_pages(section_id: str) -> list[dict]:
     """Return the pages of a single section as [{"id": ..., "name": ...}].
 
@@ -169,7 +181,7 @@ async def list_pages(section_id: str) -> list[dict]:
         raise _fail(exc) from exc
 
 
-@mcp.tool()
+@_tool(raw_xml=True)
 async def list_hierarchy_xml() -> str:
     """Advanced / escape-hatch only. Prefer get_notebooks + list_pages for navigation.
 
@@ -188,7 +200,7 @@ async def list_hierarchy_xml() -> str:
         raise _fail(exc) from exc
 
 
-@mcp.tool()
+@_tool()
 async def get_page(page_id: str, include_binary: bool = False) -> dict:
     """Return a OneNote page as structured JSON.
 
@@ -245,7 +257,7 @@ async def get_page(page_id: str, include_binary: bool = False) -> dict:
         raise _fail(exc) from exc
 
 
-@mcp.tool()
+@_tool(raw_xml=True)
 async def get_page_xml(page_id: str) -> str:
     """Advanced / escape-hatch only. Prefer get_page (structured JSON) instead.
 
@@ -265,17 +277,17 @@ async def get_page_xml(page_id: str) -> str:
         raise _fail(exc) from exc
 
 
-@mcp.tool()
+@_tool()
 async def create_page(section_id: str, title: str, parent_page_id: str | None = None) -> str:
     """Create a new page in the given section and return its page ID.
 
     section_id: ID attribute of a <one:Section> from get_notebooks.
     title: required display title for the new page.
-    parent_page_id: optional. When given, the new page is placed as a SUB-PAGE
-                    directly under that page (reordered to sit immediately after
-                    it and indented one level). The parent must be a page id in
-                    the same section. Omit for a normal top-level page appended
-                    at the end of the section.
+    parent_page_id: optional. When given, the new page becomes the LAST SUB-PAGE
+                    of that page: it is placed after the parent's existing
+                    sub-pages and indented one level below the parent. The
+                    parent must be a page id in the same section. Omit for a
+                    normal top-level page appended at the end of the section.
 
     Returns the new page's ID string. After creation, call get_page with
     the returned ID to retrieve the page structure, then replace_page to
@@ -287,7 +299,7 @@ async def create_page(section_id: str, title: str, parent_page_id: str | None = 
         raise _fail(exc) from exc
 
 
-@mcp.tool()
+@_tool(raw_xml=True)
 async def replace_page_xml(page_id: str, page_xml: str) -> str:
     """Advanced / escape-hatch only. Prefer replace_page (typed slim tool) unless you
     need direct XML control or are debugging a OneNote schema issue.
@@ -312,9 +324,10 @@ async def replace_page_xml(page_id: str, page_xml: str) -> str:
         </one:Page>
 
     IMAGE HANDLING
-    <one:Data> must contain a mcpref handle (e.g. 'mcpref:a1b2c3d4e5f6') copied
-    verbatim from a get_page response — do NOT pass raw base64 bytes.
-    The server resolves handles to real bytes before writing to OneNote.
+    <one:Data> may contain either a mcpref handle (e.g. 'mcpref:a1b2c3d4e5f6')
+    copied verbatim from a get_page response, or raw base64 image bytes.
+    Handles are resolved to their bytes before writing to OneNote; raw base64
+    is passed through unchanged. Prefer handles: they keep requests small.
 
     If a mcpref handle is not recognized (e.g. from a stale session), the call
     fails with an error. Fix: re-read the source page with get_page to refresh
@@ -322,7 +335,7 @@ async def replace_page_xml(page_id: str, page_xml: str) -> str:
 
     MANUAL-INSERT PLACEHOLDER
     When the user has asked for a screenshot that does not yet exist in OneNote,
-    do NOT invent a mcpref handle and do NOT emit raw base64. Instead emit a
+    do NOT invent a mcpref handle or image bytes. Instead emit a
     highlighted callout positioned and sized to match where the screenshot will go:
 
         <one:Outline>
@@ -350,7 +363,7 @@ async def replace_page_xml(page_id: str, page_xml: str) -> str:
         raise _fail(exc) from exc
 
 
-@mcp.tool()
+@_tool(raw_xml=True)
 async def append_page_xml(page_id: str, content_xml: str) -> str:
     """Advanced / escape-hatch only. Prefer append_page (typed slim tool) unless you
     need direct XML control or are debugging a OneNote schema issue.
@@ -373,9 +386,10 @@ async def append_page_xml(page_id: str, content_xml: str) -> str:
         </one:Outline>
 
     IMAGE HANDLING
-    <one:Data> must contain a mcpref handle (e.g. 'mcpref:a1b2c3d4e5f6') copied
-    verbatim from a get_page response — do NOT pass raw base64 bytes.
-    The server resolves handles to real bytes before writing to OneNote.
+    <one:Data> may contain either a mcpref handle (e.g. 'mcpref:a1b2c3d4e5f6')
+    copied verbatim from a get_page response, or raw base64 image bytes.
+    Handles are resolved to their bytes before writing to OneNote; raw base64
+    is passed through unchanged. Prefer handles: they keep requests small.
 
     Returns "ok" on success.
     """
@@ -386,7 +400,7 @@ async def append_page_xml(page_id: str, content_xml: str) -> str:
         raise _fail(exc) from exc
 
 
-@mcp.tool()
+@_tool()
 async def replace_page(page_id: str, title: str, outlines: list[Outline], images: list[FloatingImage] | None = None) -> str:
     """Replace the full content of a OneNote page using structured typed content.
 
@@ -423,7 +437,7 @@ async def replace_page(page_id: str, title: str, outlines: list[Outline], images
         raise _fail(exc) from exc
 
 
-@mcp.tool()
+@_tool()
 async def append_page(page_id: str, outline: Outline) -> str:
     """Append a structured content block to an existing OneNote page.
 
@@ -445,9 +459,34 @@ async def append_page(page_id: str, outline: Outline) -> str:
         raise _fail(exc) from exc
 
 
+def _raw_xml_disabled(environ: Mapping[str, str]) -> bool:
+    """Parse ONENOTE_DISABLE_RAW_XML: '1'/'true' disable the raw-XML tools,
+    unset, empty, '0' or 'false' keep them (case-insensitive)."""
+    raw = environ.get("ONENOTE_DISABLE_RAW_XML", "")
+    value = raw.strip().lower()
+    if value in ("1", "true"):
+        return True
+    if value in ("", "0", "false"):
+        return False
+    raise ValueError(f"ONENOTE_DISABLE_RAW_XML must be 1, true, 0, false or empty, got {raw!r}")
+
+
+def create_server(raw_xml_tools: bool = True) -> FastMCP:
+    """Build the MCP server; with raw_xml_tools=False the four *_xml tools are not registered."""
+    server = FastMCP("onenote")
+    for fn, is_raw_xml in _TOOLS:
+        if raw_xml_tools or not is_raw_xml:
+            server.add_tool(fn)
+    return server
+
+
 def main() -> None:
     """Entry point for the ``onenote-mcp`` console script (stdio transport)."""
-    mcp.run()
+    try:
+        raw_xml_disabled = _raw_xml_disabled(os.environ)
+    except ValueError as exc:
+        sys.exit(f"onenote-mcp: {exc}")
+    create_server(raw_xml_tools=not raw_xml_disabled).run()
 
 
 if __name__ == "__main__":
