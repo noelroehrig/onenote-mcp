@@ -7,6 +7,7 @@ skipped automatically via the onenote_available fixture chain.
 import pytest
 
 from tests.e2e.mcp_client import mcp_session  # noqa: F401 — re-export for fixture
+from tests.png import png_base64
 
 
 # A minimal 1×1 transparent PNG encoded as base64.
@@ -182,3 +183,32 @@ def test_inline_image_without_size_in_width_only_outline(mcp_session, claudespik
         f"Outlines after write: {content2.get('outlines')}"
     )
     assert img_item["handle"].startswith("mcpref:")
+
+
+@pytest.mark.e2e
+def test_inline_image_width_only_scales_proportionally(mcp_session, claudespike_section_id):
+    """An inline image given only a width keeps it and gets the height from its
+    200x100 pixel aspect ratio."""
+    title = "test_inline_image_width_only_scales_auto"
+    page_id = mcp_session.call_tool("create_page", {
+        "section_id": claudespike_section_id,
+        "title": title,
+    })
+    seed = mcp_session.call_tool("replace_page_xml", {
+        "page_id": page_id,
+        "page_xml": _make_page_xml(title, png_base64(200, 100), 150.0, 75.0),
+    })
+    assert seed == "ok", f"replace_page_xml setup failed: {seed}"
+    handle = _find_inline_image(mcp_session.call_tool("get_page", {"page_id": page_id}))["handle"]
+
+    result = mcp_session.call_tool("replace_page", {
+        "page_id": page_id,
+        "title": title,
+        "outlines": [{"items": [{"type": "inline_image", "handle": handle, "width": 240.0}]}],
+    })
+    assert result == "ok", f"replace_page returned {result!r}"
+
+    img_item = _find_inline_image(mcp_session.call_tool("get_page", {"page_id": page_id}))
+    assert img_item is not None, "Inline image lost after the width-only write"
+    assert img_item.get("width") == pytest.approx(240.0, abs=0.5)
+    assert img_item.get("height") == pytest.approx(120.0, abs=0.5)

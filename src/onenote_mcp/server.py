@@ -45,7 +45,7 @@ from onenote_mcp.com import (
 )
 from onenote_mcp.models import FloatingImage, Outline, PageContent
 from onenote_mcp.builders import (
-    build_page_xml, build_outline_xml, parse_notebook_skeleton, parse_section_pages, parse_page,
+    build_page_xml, build_append_xml, parse_notebook_skeleton, parse_section_pages, parse_page,
 )
 
 # Tool functions in definition order; create_server registers them.
@@ -452,8 +452,8 @@ async def append_page(page_id: str, outline: Outline) -> str:
     Returns "ok" on success.
     """
     try:
-        outline_xml = build_outline_xml(outline)
-        await asyncio.to_thread(_append_page_com, page_id, outline_xml)
+        page_xml = build_append_xml(outline)
+        await asyncio.to_thread(_append_page_com, page_id, page_xml)
         return "ok"
     except (OneNoteError, ValueError) as exc:
         raise _fail(exc) from exc

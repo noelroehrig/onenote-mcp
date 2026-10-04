@@ -73,8 +73,8 @@ class InlineImage(BaseModel):
 
     type: Literal["inline_image"]
     handle: str = Field(description="Image handle from a get_page response, e.g. 'mcpref:a1b2c3d4e5f6'. Must start with 'mcpref:'.")
-    width: float | None = Field(None, description="Display width in points. Omit to use the image's natural size.")
-    height: float | None = Field(None, description="Display height in points. Omit to use the image's natural size.")
+    width: float | None = Field(None, description="Display width in points. Give only width or only height to scale proportionally; omit both for the natural size.")
+    height: float | None = Field(None, description="Display height in points. Give only width or only height to scale proportionally; omit both for the natural size.")
 
     @field_validator("handle")
     @classmethod
@@ -141,8 +141,8 @@ class FloatingImage(BaseModel):
     """A floating image positioned directly on the page canvas (not inside an outline)."""
 
     handle: str = Field(description="Image handle from a get_page response, e.g. 'mcpref:a1b2c3d4e5f6'. Must start with 'mcpref:'.")
-    width: float | None = Field(None, description="Display width in points. Omit to use the image's natural size.")
-    height: float | None = Field(None, description="Display height in points. Omit to use the image's natural size.")
+    width: float | None = Field(None, description="Display width in points. Give only width or only height to scale proportionally; omit both for the natural size.")
+    height: float | None = Field(None, description="Display height in points. Give only width or only height to scale proportionally; omit both for the natural size.")
     position: Position | None = Field(None, description="Canvas position. Omit to let OneNote place the image automatically.")
 
     @field_validator("handle")

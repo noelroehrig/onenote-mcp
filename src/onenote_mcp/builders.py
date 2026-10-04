@@ -2,7 +2,7 @@
 
 The public API is two functions:
   build_page_xml(title, outlines)  → full <one:Page> XML string (for replace_page)
-  build_outline_xml(outline)       → single <one:Outline> XML string with xmlns (for append_page)
+  build_append_xml(outline)        → <one:Page> without ID holding the outline (for append_page)
 
 Read-direction parsers (xml → models/dicts):
   parse_notebook_skeleton(xml) → [{"id", "name", "sections": [...]}]
@@ -25,24 +25,44 @@ from onenote_mcp.models import (
 _ONE_NS = "http://schemas.microsoft.com/office/onenote/2013/onenote"
 ET.register_namespace("one", _ONE_NS)
 
-# Heading visual defaults for the write direction.
-# These CSS declarations are emitted as an inline span on the paragraph when
-# p.style is h1–h6.  quickStyleIndex is NOT set; instead visual properties are
-# carried in HTML so they render correctly regardless of the page's QuickStyleDef
-# table.
-_HEADING_STYLES: dict[str, list[str]] = {
-    "h1": ["font-size:16pt", "font-weight:bold", "color:#1E4E79"],
-    "h2": ["font-size:14pt", "font-weight:bold", "color:#1E4E79"],
-    "h3": ["font-size:13pt", "font-weight:bold", "color:#2E74B5"],
-    "h4": ["font-size:12pt", "font-weight:bold", "color:#2E74B5"],
-    "h5": ["font-size:11pt", "font-weight:bold", "color:#595959"],
-    "h6": ["font-size:11pt", "font-style:italic", "color:#595959"],
+# Heading styles, written as <one:QuickStyleDef> elements so OneNote treats the
+# paragraphs as real headings.  The index is local to the written XML: OneNote
+# maps each definition into the page's own style table, reusing an identical one.
+_HEADING_STYLE_DEFS: dict[str, dict[str, str]] = {
+    "h1": {"fontSize": "16.0", "fontColor": "#1E4E79", "bold": "true"},
+    "h2": {"fontSize": "14.0", "fontColor": "#1E4E79", "bold": "true"},
+    "h3": {"fontSize": "13.0", "fontColor": "#2E74B5", "bold": "true"},
+    "h4": {"fontSize": "12.0", "fontColor": "#2E74B5", "bold": "true"},
+    "h5": {"fontSize": "11.0", "fontColor": "#595959", "bold": "true"},
+    "h6": {"fontSize": "11.0", "fontColor": "#595959", "italic": "true"},
+}
+_HEADING_QUICK_STYLE_INDEX: dict[str, str] = {
+    name: str(index) for index, name in enumerate(_HEADING_STYLE_DEFS)
 }
 
 
-def _heading_default_styles(style: str) -> list[str]:
-    """Return the CSS declaration list for heading style *style*, or [] for 'normal'."""
-    return list(_HEADING_STYLES.get(style, []))
+def _quick_style_def_el(name: str) -> ET.Element:
+    """Return the <one:QuickStyleDef> element for heading style *name*."""
+    return ET.Element(f"{{{_ONE_NS}}}QuickStyleDef", {
+        "index": _HEADING_QUICK_STYLE_INDEX[name],
+        "name": name,
+        "highlightColor": "automatic",
+        "font": "Calibri",
+        "spaceBefore": "0.0",
+        "spaceAfter": "0.0",
+        **_HEADING_STYLE_DEFS[name],
+    })
+
+
+def _prepend_quick_style_defs(page_el: ET.Element) -> None:
+    """Insert the QuickStyleDefs that the headings in *page_el* refer to.
+
+    The schema requires them before <one:Title> and all page content.
+    """
+    used = {oe.get("quickStyleIndex") for oe in page_el.iter(f"{{{_ONE_NS}}}OE")}
+    names = [name for name, index in _HEADING_QUICK_STYLE_INDEX.items() if index in used]
+    for position, name in enumerate(names):
+        page_el.insert(position, _quick_style_def_el(name))
 
 
 # ---- CDATA handling ---------------------------------------------------------
@@ -141,32 +161,37 @@ def _paragraph_to_oe(
     cdata_counter: list[int],
 ) -> ET.Element:
     oe = ET.Element(f"{{{_ONE_NS}}}OE")
-    # quickStyleIndex is intentionally NOT set — it indexes into the page's
-    # QuickStyleDef table whose layout varies per page.  Heading visuals are
-    # applied via inline CSS spans instead.
+    if p.style != "normal":
+        # Refers to the QuickStyleDef that build_page_xml/build_append_xml add.
+        oe.set("quickStyleIndex", _HEADING_QUICK_STYLE_INDEX[p.style])
 
     t_el = ET.SubElement(oe, f"{{{_ONE_NS}}}T")
 
-    heading_defaults = _heading_default_styles(p.style)
-
     if p.text is not None:
-        # Heading defaults first, then explicit paragraph-level fields so the
-        # latter win (last value wins within a single style="" attribute).
-        merged = heading_defaults + _format_declarations(p)
-        _set_t_html(t_el, _wrap_span(p.text, merged), cdata_map, cdata_counter)
-
+        _set_t_html(t_el, _paragraph_html(p.text, p), cdata_map, cdata_counter)
     elif p.segments is not None:
-        segments_html = "".join(_run_to_html(run) for run in p.segments)
-        if heading_defaults:
-            # Wrap the segment HTML in an outer span carrying the heading
-            # visual defaults.  Per-segment formatting is unaffected.
-            style_str = ";".join(heading_defaults)
-            html = f'<span style="{style_str}">{segments_html}</span>'
-        else:
-            html = segments_html
+        html = "".join(_run_to_html(run) for run in p.segments)
         _set_t_html(t_el, html, cdata_map, cdata_counter)
 
     return oe
+
+
+# ---- Image size ---------------------------------------------------------------
+
+def _add_image_size(image_el: ET.Element, width: float | None, height: float | None) -> None:
+    """Add a user-set <one:Size> with whichever dimensions are given.
+
+    With only one of them, com.py computes the other from the image's aspect
+    ratio before writing, since OneNote requires both.
+    """
+    if width is None and height is None:
+        return
+    size_el = ET.SubElement(image_el, f"{{{_ONE_NS}}}Size")
+    if width is not None:
+        size_el.set("width", str(width))
+    if height is not None:
+        size_el.set("height", str(height))
+    size_el.set("isSetByUser", "true")
 
 
 # ---- FloatingImage → top-level Image element --------------------------------
@@ -181,11 +206,7 @@ def _floating_image_to_el(img: FloatingImage) -> ET.Element:
         pos_el.set("y", str(img.position.y))
         pos_el.set("z", str(img.position.z))
 
-    if img.width is not None and img.height is not None:
-        size_el = ET.SubElement(image_el, f"{{{_ONE_NS}}}Size")
-        size_el.set("width", str(img.width))
-        size_el.set("height", str(img.height))
-        size_el.set("isSetByUser", "true")
+    _add_image_size(image_el, img.width, img.height)
 
     data_el = ET.SubElement(image_el, f"{{{_ONE_NS}}}Data")
     data_el.text = img.handle
@@ -204,11 +225,7 @@ def _inline_image_to_oe(img: InlineImage) -> ET.Element:
     oe = ET.Element(f"{{{_ONE_NS}}}OE")
     image_el = ET.SubElement(oe, f"{{{_ONE_NS}}}Image")
 
-    if img.width is not None and img.height is not None:
-        size_el = ET.SubElement(image_el, f"{{{_ONE_NS}}}Size")
-        size_el.set("width", str(img.width))
-        size_el.set("height", str(img.height))
-        size_el.set("isSetByUser", "true")
+    _add_image_size(image_el, img.width, img.height)
 
     data_el = ET.SubElement(image_el, f"{{{_ONE_NS}}}Data")
     data_el.text = img.handle
@@ -394,18 +411,22 @@ def build_page_xml(title: str, outlines: list[Outline], images: list[FloatingIma
     for img in (images or []):
         root.append(_floating_image_to_el(img))
 
+    _prepend_quick_style_defs(root)
     xml_str = ET.tostring(root, encoding="unicode", xml_declaration=False)
     return _apply_cdata(xml_str, cdata_map)
 
 
-def build_outline_xml(outline: Outline) -> str:
-    """Return a single <one:Outline> XML string with xmlns for append_page."""
+def build_append_xml(outline: Outline) -> str:
+    """Return a <one:Page> without ID holding *outline* and the QuickStyleDefs
+    its headings refer to, for append_page."""
     cdata_map: dict[int, str] = {}
     cdata_counter: list[int] = [0]
 
-    el = _outline_to_el(outline, cdata_map, cdata_counter)
+    page_el = ET.Element(f"{{{_ONE_NS}}}Page")
+    page_el.append(_outline_to_el(outline, cdata_map, cdata_counter))
+    _prepend_quick_style_defs(page_el)
 
-    xml_str = ET.tostring(el, encoding="unicode", xml_declaration=False)
+    xml_str = ET.tostring(page_el, encoding="unicode", xml_declaration=False)
     return _apply_cdata(xml_str, cdata_map)
 
 
@@ -543,11 +564,13 @@ class _RunCollector(HTMLParser):
             self.runs.append((data, dict(self._stack[-1])))
 
 
-def _extract_runs(raw: str) -> list[tuple[str, dict]]:
+def _extract_runs(raw: str, implied: dict | None = None) -> list[tuple[str, dict]]:
     """Parse a raw <one:T> string into a list of (text, formatting) runs.
 
-    Plain text (no markup) yields a single unformatted run.  Adjacent runs with
-    identical formatting are merged so uniformly-styled text collapses to one run.
+    Plain text (no markup) yields a single unformatted run.  Formatting in
+    *implied* (supplied by the paragraph's quick style) is dropped from every
+    run, then adjacent runs with identical formatting are merged so
+    uniformly-styled text collapses to one run.
     """
     if not raw:
         return []
@@ -560,8 +583,10 @@ def _extract_runs(raw: str) -> list[tuple[str, dict]]:
     except Exception:
         # Malformed markup — degrade gracefully to stripped plain text.
         return [(_clean_text(raw), {})]
+    implied = implied or {}
     merged: list[tuple[str, dict]] = []
     for text, fmt in collector.runs:
+        fmt = {key: value for key, value in fmt.items() if implied.get(key) != value}
         if merged and merged[-1][1] == fmt:
             merged[-1] = (merged[-1][0] + text, fmt)
         else:
@@ -598,10 +623,14 @@ def _parse_list_item(oe_el: ET.Element) -> ListItem:
 
 _HEADING_NAMES = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
 
+# Character formatting a <one:QuickStyleDef> can carry.  OneNote repeats it as
+# inline spans in <one:T>; it is reported once, as part of the style.
+_QUICK_STYLE_FLAGS = ("bold", "italic")
+
 
 def _resolve_heading_style(
     el: ET.Element,
-    quick_style_map: dict[str, str] | None,
+    quick_style_map: dict[str, ET.Element] | None,
 ) -> str:
     """Resolve an OE's heading style ('normal' or 'h1'–'h6').
 
@@ -611,32 +640,45 @@ def _resolve_heading_style(
     non-heading name means 'normal' — never a numeric guess.  Only pages
     without any QSD table use the numeric fallback mapping.
     """
-    quick_style = el.get("quickStyleIndex")
-    if quick_style is None:
+    index = el.get("quickStyleIndex")
+    if index is None:
         return "normal"
     if quick_style_map:
-        mapped_name = quick_style_map.get(quick_style)
-        return mapped_name if mapped_name in _HEADING_NAMES else "normal"
-    return _NUMERIC_QUICK_STYLE_TO_HEADING.get(quick_style, "normal")
+        quick_style = quick_style_map.get(index)
+        name = quick_style.get("name") if quick_style is not None else None
+        return name if name in _HEADING_NAMES else "normal"
+    return _NUMERIC_QUICK_STYLE_TO_HEADING.get(index, "normal")
+
+
+def _quick_style_format(
+    el: ET.Element,
+    quick_style_map: dict[str, ET.Element] | None,
+) -> dict:
+    """Return the formatting flags that *el*'s quick style supplies, e.g. {"bold": True}."""
+    quick_style = quick_style_map.get(el.get("quickStyleIndex")) if quick_style_map else None
+    if quick_style is None:
+        return {}
+    return {flag: True for flag in _QUICK_STYLE_FLAGS if quick_style.get(flag) == "true"}
 
 
 def _parse_paragraph_oe(
     el: ET.Element,
-    quick_style_map: dict[str, str] | None = None,
+    quick_style_map: dict[str, ET.Element] | None = None,
 ) -> Paragraph:
     """Parse an OE element containing text into a Paragraph.
 
     Heading style is resolved via _resolve_heading_style (QSD table
     authoritative, numeric fallback only when no QSD table exists).
-    Inline <span style="…"> formatting is preserved: uniformly-formatted text
-    collapses to ``text`` plus whole-paragraph format fields, while mixed
-    formatting becomes ``segments``.
+    Inline <span style="…"> formatting is preserved, except what the quick
+    style already supplies: uniformly-formatted text collapses to ``text``
+    plus whole-paragraph format fields, while mixed formatting becomes
+    ``segments``.
     """
     style = _resolve_heading_style(el, quick_style_map)
 
     t_el = el.find(f"{{{_ONE_NS}}}T")
     raw = t_el.text or "" if t_el is not None else ""
-    runs = _extract_runs(raw)
+    runs = _extract_runs(raw, _quick_style_format(el, quick_style_map))
 
     if not runs:
         return Paragraph(type="paragraph", text="", style=style)
@@ -649,7 +691,7 @@ def _parse_paragraph_oe(
 
 def _parse_oe(
     el: ET.Element,
-    quick_style_map: dict[str, str] | None = None,
+    quick_style_map: dict[str, ET.Element] | None = None,
 ) -> "ContentItem | None":
     """Classify an OE element and return the appropriate ContentItem, or None for list OEs.
 
@@ -685,7 +727,7 @@ def _parse_oe(
 
 def _parse_outline_items(
     oe_elements: list[ET.Element],
-    quick_style_map: dict[str, str] | None = None,
+    quick_style_map: dict[str, ET.Element] | None = None,
 ) -> list["ContentItem"]:
     """Walk OE elements and group consecutive list OEs into List objects."""
     result: list[ContentItem] = []
@@ -792,12 +834,12 @@ def parse_page(xml: str) -> PageContent:
     """Parse a full <one:Page> XML (with mcpref image handles) into a PageContent."""
     root = ET.fromstring(xml)
 
-    # Build quick-style map from <one:QuickStyleDef> direct children of the page.
-    # Each def has an ``index`` attribute and a ``name`` attribute (e.g. "h1", "p").
-    # _parse_paragraph_oe uses this map to resolve quickStyleIndex to a heading
-    # level; pages without defs use the numeric fallback.
-    quick_style_map: dict[str, str] = {
-        def_el.get("index"): def_el.get("name")
+    # Map quickStyleIndex to the page's <one:QuickStyleDef> elements, which
+    # carry a ``name`` (e.g. "h1", "p") and the style's formatting.
+    # _parse_paragraph_oe resolves headings through this map; pages without
+    # defs use the numeric fallback.
+    quick_style_map: dict[str, ET.Element] = {
+        def_el.get("index"): def_el
         for def_el in root.findall(f"{{{_ONE_NS}}}QuickStyleDef")
         if def_el.get("index") is not None and def_el.get("name") is not None
     }
