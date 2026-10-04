@@ -1,11 +1,17 @@
 name: Release
 
-# Tag push v*: unit tests, build + smoke-test onenote-mcp.exe, publish a GitHub Release.
-# Manual run: unit tests, build + smoke-test, keep the exe as a short-lived artifact.
+# Every run: unit tests, build + smoke-test onenote-mcp.exe, keep it as a short-lived artifact.
+# Manual run with "publish" ticked: then tag the commit v<pyproject.toml version> and
+# publish a GitHub Release. Tag push v*: publish a GitHub Release for the pushed tag.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish release v<version in pyproject.toml> from this commit"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,21 +40,35 @@ jobs:
     needs: test
     runs-on: windows-latest
     timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.release-tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Check tag matches pyproject.toml version
-        if: github.ref_type == 'tag'
+      - name: Determine release tag from pyproject.toml version
+        id: release-tag
         env:
-          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH: ${{ inputs.publish }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
           if ($LASTEXITCODE -ne 0) { throw "Could not read the version from pyproject.toml" }
-          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG does not match pyproject.toml version $version (expected tag v$version)" }
-          "Tag $env:TAG matches pyproject.toml version $version"
+          $tag = "v$version"
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne $tag) {
+            throw "Tag $env:GITHUB_REF_NAME does not match pyproject.toml version $version (expected tag $tag)"
+          }
+          if ($env:PUBLISH -eq 'true') {
+            if ($env:GITHUB_REF -ne "refs/heads/$env:DEFAULT_BRANCH") { throw "Publish releases from $env:DEFAULT_BRANCH, not $env:GITHUB_REF" }
+            $refs = gh api "repos/$env:GITHUB_REPOSITORY/git/matching-refs/tags/$tag" --jq '.[].ref'
+            if ($LASTEXITCODE -ne 0) { throw "Could not check whether tag $tag exists" }
+            if ($refs -contains "refs/tags/$tag") { throw "Tag $tag already exists; set a new version in pyproject.toml to publish" }
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "Release tag: $tag"
 
       - run: python -m pip install . "pyinstaller==$env:PYINSTALLER_VERSION"
 
@@ -76,7 +96,7 @@ jobs:
           retention-days: 1
 
   release:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    if: (github.event_name == 'push' && github.ref_type == 'tag') || inputs.publish
     needs: build
     runs-on: windows-latest
     timeout-minutes: 5
@@ -88,14 +108,15 @@ jobs:
           name: onenote-mcp
           path: dist
 
+      # On a manual run the tag does not exist yet: gh creates it on --target.
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.build.outputs.tag }}
         run: >
           gh release create $env:TAG
           dist/onenote-mcp.exe dist/onenote-mcp.exe.sha256
           --repo $env:GITHUB_REPOSITORY
           --title $env:TAG
+          --target $env:GITHUB_SHA
           --generate-notes
-          --verify-tag

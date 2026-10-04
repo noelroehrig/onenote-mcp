@@ -293,13 +293,19 @@ notebook.
 
 ### Releases and the standalone exe
 
-`.github/workflows/release.yml` runs the unit tests, builds `onenote-mcp.exe` and
-smoke-tests it. On a pushed `v*` tag it then publishes a GitHub release with the exe
-and its checksum; a manual run (`workflow_dispatch`) stops after the smoke test and
-keeps the exe as a workflow artifact for one day.
+`.github/workflows/release.yml` runs the unit tests, builds `onenote-mcp.exe`,
+smoke-tests it and keeps the exe as a workflow artifact for one day.
 
-To release, set `version` in `pyproject.toml` and push the matching tag, e.g. `v1.0.1`
-for `1.0.1`. The build fails if the two differ.
+To release, set `version` in `pyproject.toml` and merge it to `main`. Then either:
+
+- In GitHub, open Actions → Release → Run workflow on `main` and tick **Publish
+  release**. After the tests and the smoke test pass, the run tags that commit
+  (`v1.0.1` for version `1.0.1`) and publishes a GitHub release with the exe and its
+  checksum. It refuses to publish from another branch or when the tag already exists.
+- Or push the matching tag, e.g. `git tag v1.0.1` and `git push origin v1.0.1`. The
+  build fails if the tag and the version differ.
+
+A manual run without the checkbox only builds and tests.
 
 To build locally, use a fresh venv so the build matches CI, with the PyInstaller
 version pinned in the workflow:
