@@ -174,14 +174,9 @@ def test_replace_page_with_heading(mcp_session, claudespike_section_id):
     assert result == "ok", f"replace_page returned {result!r}"
 
     content = mcp_session.call_tool("get_page", {"page_id": page_id})
-    # OneNote normalises quickStyleIndex on read-back; verify text survived.
-    all_texts = []
-    for outline in content.get("outlines", []):
-        for item in outline.get("items", []):
-            if item.get("text"):
-                all_texts.append(item["text"])
-    assert any("Big Title" in t for t in all_texts), (
-        f"Expected 'Big Title' in paragraph texts after heading write, got: {all_texts}"
+    items = [item for outline in content.get("outlines", []) for item in outline.get("items", [])]
+    assert [(item.get("text"), item.get("style")) for item in items] == [("Big Title", "h1")], (
+        f"Expected the h1 'Big Title' to read back as a heading, got: {items}"
     )
 
 

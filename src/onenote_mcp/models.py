@@ -6,7 +6,18 @@ FastMCP exposes these types as machine-readable JSON schema to the model.
 
 from __future__ import annotations
 from typing import Annotated, Literal, Union
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
+
+# Style values are written into an HTML style="..." attribute, so they are
+# restricted to characters that cannot end the declaration or the attribute.
+HEX_COLOR_PATTERN = r"^#(?:[0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$"
+FONT_FAMILY_PATTERN = r"^[A-Za-z0-9 ,.\-]+$"
+FONT_FAMILY_MAX_LENGTH = 64
+
+HexColor = Annotated[str, StringConstraints(pattern=HEX_COLOR_PATTERN)]
+FontFamily = Annotated[
+    str, StringConstraints(pattern=FONT_FAMILY_PATTERN, max_length=FONT_FAMILY_MAX_LENGTH)
+]
 
 
 class TextRun(BaseModel):
@@ -17,10 +28,10 @@ class TextRun(BaseModel):
     italic: bool = Field(False, description="Italic text.")
     underline: bool = Field(False, description="Underlined text.")
     strikethrough: bool = Field(False, description="Strikethrough text.")
-    color: str | None = Field(None, description="Text colour as a hex string, e.g. '#ff0000'. None means default.")
-    highlight: str | None = Field(None, description="Highlight colour as a hex string, e.g. '#ffeb3b'. None means no highlight.")
+    color: HexColor | None = Field(None, description="Text colour as '#RGB' or '#RRGGBB', e.g. '#ff0000'. None means default.")
+    highlight: HexColor | None = Field(None, description="Highlight colour as '#RGB' or '#RRGGBB', e.g. '#ffeb3b'. None means no highlight.")
     font_size: float | None = Field(None, description="Font size in points. None means default.")
-    font_family: str | None = Field(None, description="Font family name, e.g. 'Courier New'. None means default.")
+    font_family: FontFamily | None = Field(None, description="Font family name, e.g. 'Courier New': letters, digits, spaces, hyphens, commas and periods, at most 64 characters. None means default.")
 
 
 class Paragraph(BaseModel):
@@ -34,10 +45,10 @@ class Paragraph(BaseModel):
     italic: bool = Field(False, description="Italic. Applied to whole paragraph when 'text' is used; ignored when 'segments' is used.")
     underline: bool = Field(False, description="Underline. Applied to whole paragraph when 'text' is used; ignored when 'segments' is used.")
     strikethrough: bool = Field(False, description="Strikethrough. Applied to whole paragraph when 'text' is used; ignored when 'segments' is used.")
-    color: str | None = Field(None, description="Text colour as hex string. Applied to whole paragraph when 'text' is used; ignored when 'segments' is used.")
-    highlight: str | None = Field(None, description="Highlight colour as hex string. Applied to whole paragraph when 'text' is used; ignored when 'segments' is used.")
+    color: HexColor | None = Field(None, description="Text colour as '#RGB' or '#RRGGBB'. Applied to whole paragraph when 'text' is used; ignored when 'segments' is used.")
+    highlight: HexColor | None = Field(None, description="Highlight colour as '#RGB' or '#RRGGBB'. Applied to whole paragraph when 'text' is used; ignored when 'segments' is used.")
     font_size: float | None = Field(None, description="Font size in points. Applied to whole paragraph when 'text' is used; ignored when 'segments' is used.")
-    font_family: str | None = Field(None, description="Font family name. Applied to whole paragraph when 'text' is used; ignored when 'segments' is used.")
+    font_family: FontFamily | None = Field(None, description="Font family name (letters, digits, spaces, hyphens, commas and periods, at most 64 characters). Applied to whole paragraph when 'text' is used; ignored when 'segments' is used.")
 
     @model_validator(mode="after")
     def _check_text_or_segments(self) -> Paragraph:
@@ -62,8 +73,8 @@ class InlineImage(BaseModel):
 
     type: Literal["inline_image"]
     handle: str = Field(description="Image handle from a get_page response, e.g. 'mcpref:a1b2c3d4e5f6'. Must start with 'mcpref:'.")
-    width: float | None = Field(None, description="Display width in points. Omit to use the image's natural size.")
-    height: float | None = Field(None, description="Display height in points. Omit to use the image's natural size.")
+    width: float | None = Field(None, description="Display width in points. Give only width or only height to scale proportionally; omit both for the natural size.")
+    height: float | None = Field(None, description="Display height in points. Give only width or only height to scale proportionally; omit both for the natural size.")
 
     @field_validator("handle")
     @classmethod
@@ -130,8 +141,8 @@ class FloatingImage(BaseModel):
     """A floating image positioned directly on the page canvas (not inside an outline)."""
 
     handle: str = Field(description="Image handle from a get_page response, e.g. 'mcpref:a1b2c3d4e5f6'. Must start with 'mcpref:'.")
-    width: float | None = Field(None, description="Display width in points. Omit to use the image's natural size.")
-    height: float | None = Field(None, description="Display height in points. Omit to use the image's natural size.")
+    width: float | None = Field(None, description="Display width in points. Give only width or only height to scale proportionally; omit both for the natural size.")
+    height: float | None = Field(None, description="Display height in points. Give only width or only height to scale proportionally; omit both for the natural size.")
     position: Position | None = Field(None, description="Canvas position. Omit to let OneNote place the image automatically.")
 
     @field_validator("handle")

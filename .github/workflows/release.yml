@@ -1,0 +1,101 @@
+name: Release
+
+# Tag push v*: unit tests, build + smoke-test onenote-mcp.exe, publish a GitHub Release.
+# Manual run: unit tests, build + smoke-test, keep the exe as a short-lived artifact.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"
+  PYINSTALLER_VERSION: "6.22.3"
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: python -m pip install ".[dev]"
+      - run: python -m pytest tests/unit/ -q
+
+  build:
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Check tag matches pyproject.toml version
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+          if ($LASTEXITCODE -ne 0) { throw "Could not read the version from pyproject.toml" }
+          if ("v$version" -ne $env:TAG) { throw "Tag $env:TAG does not match pyproject.toml version $version (expected tag v$version)" }
+          "Tag $env:TAG matches pyproject.toml version $version"
+
+      - run: python -m pip install . "pyinstaller==$env:PYINSTALLER_VERSION"
+
+      - name: Build onenote-mcp.exe
+        run: python -m PyInstaller packaging/onenote-mcp.spec --noconfirm --clean
+
+      - name: Smoke-test onenote-mcp.exe
+        timeout-minutes: 5
+        run: python packaging/smoke_test.py dist/onenote-mcp.exe
+
+      - name: Write SHA256 checksum
+        working-directory: dist
+        run: |
+          $hash = (Get-FileHash onenote-mcp.exe -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$PWD/onenote-mcp.exe.sha256", "$hash  onenote-mcp.exe`n")
+          Get-Content onenote-mcp.exe.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: onenote-mcp
+          path: |
+            dist/onenote-mcp.exe
+            dist/onenote-mcp.exe.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: onenote-mcp
+          path: dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: >
+          gh release create $env:TAG
+          dist/onenote-mcp.exe dist/onenote-mcp.exe.sha256
+          --repo $env:GITHUB_REPOSITORY
+          --title $env:TAG
+          --generate-notes
+          --verify-tag

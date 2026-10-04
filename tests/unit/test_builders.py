@@ -2,8 +2,8 @@
 import xml.etree.ElementTree as ET
 import pytest
 from onenote_mcp.builders import (
-    _run_to_html, _paragraph_html, _heading_default_styles, _cdata_placeholder, _apply_cdata,
-    build_page_xml, build_outline_xml,
+    _run_to_html, _paragraph_html, _cdata_placeholder, _apply_cdata,
+    build_page_xml, build_append_xml,
     parse_page,
     _clean_text, _floating_image_to_el,
 )
@@ -103,25 +103,6 @@ def test_run_to_html_multiple_styles():
 # _paragraph_html
 # ---------------------------------------------------------------------------
 
-def test_heading_default_styles_h1():
-    styles = _heading_default_styles("h1")
-    assert "font-size:16pt" in styles
-    assert "font-weight:bold" in styles
-    assert "color:#1E4E79" in styles
-
-
-def test_heading_default_styles_h6():
-    styles = _heading_default_styles("h6")
-    assert "font-size:11pt" in styles
-    assert "font-style:italic" in styles
-    assert "color:#595959" in styles
-    assert not any("font-weight" in s for s in styles), "h6 must not have font-weight"
-
-
-def test_heading_default_styles_normal():
-    assert _heading_default_styles("normal") == []
-
-
 def test_paragraph_html_plain():
     p = Paragraph(type="paragraph", text="plain text")
     result = _paragraph_html("plain text", p)
@@ -190,33 +171,38 @@ def test_build_page_xml_bold_paragraph():
     assert "font-weight:bold" in xml
 
 
+def _quick_style_defs(root: ET.Element) -> dict[str, ET.Element]:
+    """Return the page's QuickStyleDefs by index."""
+    return {qsd.get("index"): qsd for qsd in root.findall("one:QuickStyleDef", _NS)}
+
+
 def test_build_page_xml_h1_heading():
-    # h1 headings must use inline CSS spans, not quickStyleIndex.
-    # quickStyleIndex is page-relative and cannot be reliably hard-coded.
+    # The heading look lives in a QuickStyleDef named "h1", so OneNote treats
+    # the paragraph as a real heading; the text itself carries no inline CSS.
     outline = Outline(items=[Paragraph(type="paragraph", text="Heading", style="h1")])
-    xml = build_page_xml("Title", [outline])
-    root = _parse_xml(xml)
+    root = _parse_xml(build_page_xml("Title", [outline]))
+    assert root[0].tag == f"{{{_NS['one']}}}QuickStyleDef", "QuickStyleDefs must precede <one:Title>"
     oe_el = root.find("one:Outline/one:OEChildren/one:OE", _NS)
-    assert oe_el is not None
-    assert oe_el.get("quickStyleIndex") is None, "h1 must NOT emit quickStyleIndex"
-    # CSS properties must appear in the raw XML (inside CDATA)
-    assert "font-size:16pt" in xml
-    assert "font-weight:bold" in xml
-    assert "color:#1E4E79" in xml
+    qsd = _quick_style_defs(root)[oe_el.get("quickStyleIndex")]
+    assert qsd.get("name") == "h1"
+    assert qsd.get("font") == "Calibri"
+    assert qsd.get("fontSize") == "16.0"
+    assert qsd.get("fontColor") == "#1E4E79"
+    assert qsd.get("bold") == "true"
+    assert oe_el.find("one:T", _NS).text == "Heading"
 
 
 def test_build_page_xml_h6_heading():
-    # h6: italic, no bold, color #595959, font-size 11pt
+    # h6: italic, not bold, color #595959, font size 11
     outline = Outline(items=[Paragraph(type="paragraph", text="H6", style="h6")])
-    xml = build_page_xml("Title", [outline])
-    root = _parse_xml(xml)
+    root = _parse_xml(build_page_xml("Title", [outline]))
     oe_el = root.find("one:Outline/one:OEChildren/one:OE", _NS)
-    assert oe_el is not None
-    assert oe_el.get("quickStyleIndex") is None, "h6 must NOT emit quickStyleIndex"
-    assert "font-size:11pt" in xml
-    assert "font-style:italic" in xml
-    assert "color:#595959" in xml
-    assert "font-weight:bold" not in xml
+    qsd = _quick_style_defs(root)[oe_el.get("quickStyleIndex")]
+    assert qsd.get("name") == "h6"
+    assert qsd.get("fontSize") == "11.0"
+    assert qsd.get("fontColor") == "#595959"
+    assert qsd.get("italic") == "true"
+    assert qsd.get("bold") is None
 
 
 def test_build_page_xml_normal_no_quick_style():
@@ -226,6 +212,28 @@ def test_build_page_xml_normal_no_quick_style():
     oe_el = root.find("one:Outline/one:OEChildren/one:OE", _NS)
     assert oe_el is not None
     assert oe_el.get("quickStyleIndex") is None
+    assert root.find("one:QuickStyleDef", _NS) is None
+
+
+def test_build_page_xml_declares_each_used_heading_style_once():
+    outline = Outline(items=[
+        Paragraph(type="paragraph", text="A", style="h1"),
+        Paragraph(type="paragraph", text="B", style="h3"),
+        Paragraph(type="paragraph", text="C", style="h1"),
+        Paragraph(type="paragraph", text="D"),
+    ])
+    root = _parse_xml(build_page_xml("Title", [outline]))
+    defs = _quick_style_defs(root)
+    assert sorted(qsd.get("name") for qsd in defs.values()) == ["h1", "h3"]
+    oes = root.findall("one:Outline/one:OEChildren/one:OE", _NS)
+    names = [defs[oe.get("quickStyleIndex")].get("name") if oe.get("quickStyleIndex") else None for oe in oes]
+    assert names == ["h1", "h3", "h1", None]
+
+
+def test_build_page_xml_heading_keeps_explicit_formatting_inline():
+    outline = Outline(items=[Paragraph(type="paragraph", text="Red", style="h2", color="#C00000")])
+    xml = build_page_xml("Title", [outline])
+    assert '<span style="color:#C00000">Red</span>' in xml
 
 
 def test_build_page_xml_bullet_list():
@@ -355,24 +363,32 @@ def test_build_page_xml_segments():
 
 
 # ---------------------------------------------------------------------------
-# build_outline_xml
+# build_append_xml
 # ---------------------------------------------------------------------------
 
-def test_build_outline_xml_is_outline_element():
+def test_build_append_xml_wraps_outline_in_page_without_id():
     outline = Outline(items=[Paragraph(type="paragraph", text="content")])
-    xml = build_outline_xml(outline)
-    root = _parse_xml(xml)
-    _ONE_NS = "http://schemas.microsoft.com/office/onenote/2013/onenote"
-    assert root.tag == f"{{{_ONE_NS}}}Outline"
+    root = _parse_xml(build_append_xml(outline))
+    assert root.tag == f"{{{_NS['one']}}}Page"
+    assert root.get("ID") is None
+    assert [child.tag for child in root] == [f"{{{_NS['one']}}}Outline"]
 
 
-def test_build_outline_xml_paragraph():
+def test_build_append_xml_paragraph():
     outline = Outline(items=[Paragraph(type="paragraph", text="content")])
-    xml = build_outline_xml(outline)
-    root = _parse_xml(xml)
-    t_el = root.find("one:OEChildren/one:OE/one:T", _NS)
+    root = _parse_xml(build_append_xml(outline))
+    t_el = root.find("one:Outline/one:OEChildren/one:OE/one:T", _NS)
     assert t_el is not None
     assert t_el.text == "content"
+
+
+def test_build_append_xml_declares_heading_style_before_outline():
+    outline = Outline(items=[Paragraph(type="paragraph", text="Appended", style="h2")])
+    root = _parse_xml(build_append_xml(outline))
+    qsd, outline_el = root
+    assert qsd.tag == f"{{{_NS['one']}}}QuickStyleDef"
+    assert qsd.get("name") == "h2"
+    assert outline_el.find("one:OEChildren/one:OE", _NS).get("quickStyleIndex") == qsd.get("index")
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +715,47 @@ def test_parse_page_body_at_index_1_is_normal_not_h1():
     assert p.style == "normal", f"body text must be 'normal', got {p.style!r}"
 
 
+def test_parse_page_heading_drops_bold_supplied_by_its_quick_style():
+    """OneNote repeats a QuickStyleDef's bold as an inline span in <one:T>;
+    it is reported once, as part of the heading style."""
+    xml = _page_xml(
+        '<one:QuickStyleDef index="0" name="p" font="Calibri" fontSize="11.0"/>',
+        '<one:QuickStyleDef index="1" name="h1" font="Calibri" fontSize="16.0" bold="true"/>',
+        '<one:Outline><one:OEChildren>'
+        "  <one:OE quickStyleIndex=\"1\"><one:T><![CDATA[<span style='font-weight:bold'>Integration test</span>]]></one:T></one:OE>"
+        '</one:OEChildren></one:Outline>'
+    )
+    p = parse_page(xml).outlines[0].items[0]
+    assert (p.style, p.text, p.bold, p.segments) == ("h1", "Integration test", False, None)
+
+
+def test_parse_page_heading_keeps_formatting_beyond_its_quick_style():
+    xml = _page_xml(
+        '<one:QuickStyleDef index="1" name="h3" font="Calibri" fontSize="13.0" bold="true"/>',
+        '<one:Outline><one:OEChildren>'
+        '  <one:OE quickStyleIndex="1"><one:T><![CDATA['
+        "<span style='font-weight:bold'>Plain </span>"
+        "<span style='font-weight:bold;font-style:italic'>italic</span>"
+        ']]></one:T></one:OE>'
+        '</one:OEChildren></one:Outline>'
+    )
+    p = parse_page(xml).outlines[0].items[0]
+    assert p.style == "h3"
+    assert [(s.text, s.bold, s.italic) for s in p.segments] == [("Plain ", False, False), ("italic", False, True)]
+
+
+def test_parse_page_bold_on_heading_without_bold_style_is_kept():
+    """A OneNote-native heading style has no bold; bold on its text is real formatting."""
+    xml = _page_xml(
+        '<one:QuickStyleDef index="2" name="h1" font="Calibri" fontSize="14.0"/>',
+        '<one:Outline><one:OEChildren>'
+        "  <one:OE quickStyleIndex=\"2\"><one:T><![CDATA[<span style='font-weight:bold'>Bold heading</span>]]></one:T></one:OE>"
+        '</one:OEChildren></one:Outline>'
+    )
+    p = parse_page(xml).outlines[0].items[0]
+    assert (p.style, p.text, p.bold) == ("h1", "Bold heading", True)
+
+
 def test_parse_page_index_not_in_qsd_table_is_normal():
     """When a QSD table exists but does not define this index, do NOT guess a
     heading from the number — treat it as normal."""
@@ -820,19 +877,14 @@ def test_roundtrip_plain_paragraph():
 
 
 def test_roundtrip_heading():
-    # Explicit trade-off: our inline-CSS heading emissions do not carry a
-    # quickStyleIndex, so the read path cannot reconstruct the heading style
-    # from the XML we wrote.  Text survives; style degrades to "normal".
-    # Reading a OneNote-native page with a proper QuickStyleDef table still
-    # resolves heading styles correctly (see
-    # test_parse_page_h1_resolved_via_qsd_table).
     outline = Outline(items=[Paragraph(type="paragraph", text="Chapter", style="h2")])
     xml = build_page_xml("Doc", [outline])
     page = parse_page(xml)
     p = page.outlines[0].items[0]
     assert isinstance(p, Paragraph)
     assert p.text == "Chapter"
-    # style will be "normal" — this is the accepted round-trip degradation
+    assert p.style == "h2"
+    assert p.bold is False
 
 
 def test_roundtrip_bullet_list():
@@ -915,6 +967,20 @@ def test_floating_image_to_el_size():
     assert size_el.get("width") == "72.0"
     assert size_el.get("height") == "72.0"
     assert size_el.get("isSetByUser") == "true"
+
+
+def test_floating_image_to_el_height_only():
+    """With only height, Size carries just that; com.py adds the width before writing."""
+    el = _floating_image_to_el(FloatingImage(handle="mcpref:abc123def456", height=50.0))
+    assert el.find("one:Size", _NS).attrib == {"height": "50.0", "isSetByUser": "true"}
+
+
+def test_build_page_xml_inline_image_width_only():
+    """With only width, Size carries just that; com.py adds the height before writing."""
+    outline = Outline(items=[InlineImage(type="inline_image", handle="mcpref:abc123def456", width=240.0)])
+    root = _parse_xml(build_page_xml("Title", [outline]))
+    size_el = root.find("one:Outline/one:OEChildren/one:OE/one:Image/one:Size", _NS)
+    assert size_el.attrib == {"width": "240.0", "isSetByUser": "true"}
 
 
 def test_floating_image_to_el_no_size_when_absent():
@@ -1096,3 +1162,144 @@ def test_roundtrip_inline_image():
     assert recovered.handle == "mcpref:abc123def456"
     assert recovered.width == 100.0
     assert recovered.height == 200.0
+
+
+# ---------------------------------------------------------------------------
+# Text escaping: OneNote reads <one:T> content as HTML, so text is escaped on
+# write and must come back unchanged from parse_page.
+# ---------------------------------------------------------------------------
+
+_SPECIAL_TEXTS = [
+    "a < b > c",
+    "Fish & Chips, &amp; and &lt;",
+    "<b>not bold</b>",
+    "ends a CDATA section ]]> early",
+    "\"double\" and 'single' quotes",
+    "Grüße aus Köln: äöü ÄÖÜ ß",
+]
+
+
+def _first_item(outline: Outline, title: str = "Doc"):
+    return parse_page(build_page_xml(title, [outline])).outlines[0].items[0]
+
+
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_plain_paragraph(text):
+    p = _first_item(Outline(items=[Paragraph(type="paragraph", text=text)]))
+    assert p.text == text
+    assert p.segments is None and p.bold is False
+
+
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_styled_paragraph(text):
+    para = Paragraph(type="paragraph", text=text, bold=True, color="#C00000", font_family="Courier New")
+    p = _first_item(Outline(items=[para]))
+    assert p.text == text
+    assert p.bold is True
+    assert p.color == "#C00000"
+    assert p.font_family == "Courier New"
+
+
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_heading(text):
+    p = _first_item(Outline(items=[Paragraph(type="paragraph", text=text, style="h1")]))
+    assert p.text == text
+
+
+@pytest.mark.parametrize("style", ["normal", "h2"])
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_segments(text, style):
+    segments = [TextRun(text=text), TextRun(text=text, italic=True)]
+    p = _first_item(Outline(items=[Paragraph(type="paragraph", segments=segments, style=style)]))
+    assert [s.text for s in p.segments] == [text, text]
+    assert p.segments[1].italic is True
+
+
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_list_items(text):
+    items = [ListItem(text=text), ListItem(segments=[TextRun(text=text, bold=True)])]
+    lst = _first_item(Outline(items=[List(type="list", style="bullet", items=items)]))
+    assert lst.items[0].text == text
+    assert lst.items[1].segments[0].text == text
+
+
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_title(text):
+    assert parse_page(build_page_xml(text, [])).title == text
+
+
+def test_special_text_round_trips_in_image_placeholder():
+    ph = ImagePlaceholder(type="image_placeholder", description="<b> & ]]>")
+    p = _first_item(Outline(items=[ph]))
+    assert p.text == "[INSERT IMAGE: <b> & ]]>]"
+
+
+def test_t_content_is_escaped_html():
+    """What OneNote receives: escaped text, wrapped in a span only when styled."""
+    text = "<b>x</b> & ]]>"
+    outline = Outline(items=[
+        Paragraph(type="paragraph", text=text),
+        Paragraph(type="paragraph", text=text, bold=True),
+    ])
+    root = ET.fromstring(build_page_xml("Doc", [outline]))
+    plain_t, styled_t = [
+        oe.find("one:T", _NS).text for oe in root.iterfind("one:Outline/one:OEChildren/one:OE", _NS)
+    ]
+    assert plain_t == "&lt;b&gt;x&lt;/b&gt; &amp; ]]&gt;"
+    assert styled_t == '<span style="font-weight:bold">&lt;b&gt;x&lt;/b&gt; &amp; ]]&gt;</span>'
+
+
+def test_cdata_terminator_only_closes_cdata_sections():
+    text = "ends ]]> early"
+    outline = Outline(items=[
+        Paragraph(type="paragraph", text=text),
+        Paragraph(type="paragraph", text=text, italic=True),
+        Paragraph(type="paragraph", segments=[TextRun(text=text, bold=True)]),
+        List(type="list", style="numbered", items=[ListItem(segments=[TextRun(text=text, bold=True)])]),
+        ImagePlaceholder(type="image_placeholder", description=text),
+    ])
+    xml = build_page_xml(text, [outline])
+    assert xml.count("<![CDATA[") == 4
+    assert xml.count("]]>") == xml.count("<![CDATA[")
+
+
+def test_apply_cdata_rejects_cdata_terminator():
+    with pytest.raises(ValueError, match=r"\]\]>"):
+        _apply_cdata("__CDATA_000000__", {0: "a ]]> b"})
+
+
+# ---------------------------------------------------------------------------
+# Style values read from OneNote are normalized to what the models accept
+# ---------------------------------------------------------------------------
+
+def _styled_paragraph(style: str, text: str = "styled") -> Paragraph:
+    xml = _page_xml(
+        '<one:Outline><one:OEChildren>'
+        f"  <one:OE><one:T><![CDATA[<span style='{style}'>{text}</span>]]></one:T></one:OE>"
+        '</one:OEChildren></one:Outline>'
+    )
+    return parse_page(xml).outlines[0].items[0]
+
+
+def test_parse_named_highlight_maps_to_hex():
+    p = _styled_paragraph("background:yellow;mso-highlight:yellow")
+    assert p.text == "styled"
+    assert p.highlight == "#FFFF00"
+
+
+def test_parse_unsupported_color_value_is_left_out():
+    p = _styled_paragraph("color:windowtext;font-weight:bold")
+    assert p.text == "styled"
+    assert p.color is None
+    assert p.bold is True
+
+
+def test_parse_quoted_font_family_is_unquoted():
+    p = _styled_paragraph('font-family:"Segoe UI",Arial')
+    assert p.font_family == "Segoe UI,Arial"
+
+
+def test_parse_unsupported_font_family_is_left_out():
+    p = _styled_paragraph("font-family:ＭＳ ゴシック")
+    assert p.text == "styled"
+    assert p.font_family is None

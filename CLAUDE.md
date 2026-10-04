@@ -30,9 +30,11 @@ src/onenote_mcp/
                notebook allowlist
   builders.py  model <-> OneNote XML conversion
   models.py    Pydantic models = the JSON schema of the structured tools
+  images.py    pixel size from image header bytes (proportional image scaling)
 ```
 
-Layering: `server.py` → `com.py` → `builders.py`/`models.py`. COM calls run on
+Layering: `server.py` → `com.py` → `builders.py`/`models.py`, and `com.py` →
+`images.py`. COM calls run on
 fresh daemon threads with hard timeouts (`_run_com`); functions named `_*_impl`
 run on the worker thread and must not call CoInitialize themselves.
 

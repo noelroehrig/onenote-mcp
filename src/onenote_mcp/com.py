@@ -32,7 +32,10 @@ id-scoped read/write verifies that its target lives inside one of them.  Unset
 or blank means unrestricted.
 """
 
+import base64
+import binascii
 import hashlib
+import html
 import os
 import sys
 import threading
@@ -44,6 +47,8 @@ from collections import OrderedDict
 import comtypes
 import comtypes.client
 import comtypes.typeinfo
+
+from onenote_mcp.images import pixel_size
 
 _ONE_NS = "http://schemas.microsoft.com/office/onenote/2013/onenote"
 ET.register_namespace("one", _ONE_NS)
@@ -101,9 +106,19 @@ def _discover_onenote_exe() -> str:
       bare:          C:\\...\\ONENOTE.EXE
       quoted:        "C:\\...\\ONENOTE.EXE"
       quoted + args: "C:\\...\\ONENOTE.EXE" /something
+
+    Raises OneNoteError when the key is missing, i.e. OneNote desktop is not
+    installed (the Store app registers no COM server).
     """
-    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, _CLSID_LOCAL_SERVER) as key:
-        value, _ = winreg.QueryValueEx(key, None)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, _CLSID_LOCAL_SERVER) as key:
+            value, _ = winreg.QueryValueEx(key, None)
+    except FileNotFoundError as exc:
+        raise OneNoteError(
+            "OneNote desktop is not registered for COM automation. Install the "
+            "desktop edition (2016 or Microsoft 365); the Microsoft Store app "
+            "has no COM interface."
+        ) from exc
     value = value.strip()
     if value.startswith('"'):
         # Quoted path: "C:\...\ONENOTE.EXE" or "C:\...\ONENOTE.EXE" /args
@@ -358,6 +373,46 @@ def _resolve_mcpref_to_data(xml: str, app=None) -> str:
     return ET.tostring(root, encoding="unicode", xml_declaration=False)
 
 
+def _complete_image_sizes(xml: str) -> str:
+    """Add the missing dimension to every <one:Image> whose <one:Size> has only
+    width or only height, keeping the image's pixel aspect ratio.
+
+    OneNote rejects a Size without both attributes.  Runs after handle
+    resolution, so <one:Data> holds the image bytes.  Raises
+    OneNoteError(code="bad_request") when the pixel size cannot be read.
+    """
+    root = ET.fromstring(xml)
+    size_tag = f"{{{_ONE_NS}}}Size"
+    data_tag = f"{{{_ONE_NS}}}Data"
+    for img_el in root.iter(f"{{{_ONE_NS}}}Image"):
+        size_el = img_el.find(size_tag)
+        if size_el is None or (size_el.get("width") is None) == (size_el.get("height") is None):
+            continue
+        dims = _image_pixel_size(img_el.find(data_tag))
+        if dims is None:
+            raise OneNoteError(
+                "Cannot read the pixel size of an image given only width or only "
+                "height (supported: PNG, JPEG, GIF, BMP). Pass both width and height.",
+                code="bad_request",
+            )
+        px_width, px_height = dims
+        if size_el.get("width") is not None:
+            size_el.set("height", str(float(size_el.get("width")) * px_height / px_width))
+        else:
+            size_el.set("width", str(float(size_el.get("height")) * px_width / px_height))
+    return ET.tostring(root, encoding="unicode", xml_declaration=False)
+
+
+def _image_pixel_size(data_el: ET.Element | None) -> tuple[int, int] | None:
+    """Return the pixel size of the base64 image in *data_el*, or None if unreadable."""
+    if data_el is None or not data_el.text:
+        return None
+    try:
+        return pixel_size(base64.b64decode(data_el.text))
+    except binascii.Error:
+        return None
+
+
 def validate_handles(handles: list[str]) -> dict[str, bool]:
     """Return {handle: resolvable} for each handle without fetching bytes.
 
@@ -534,7 +589,7 @@ def _replace_page_impl(page_id: str, page_xml: str) -> None:
     # Resolve image handles to bytes NOW, while the source images still exist on
     # the page — a handle read with include_binary=False is fetched lazily via
     # GetBinaryPageContent, which would fail if we deleted the image first.
-    serialized = _resolve_mcpref_to_data(serialized, app)
+    serialized = _complete_image_sizes(_resolve_mcpref_to_data(serialized, app))
 
     # --- delete-pass: remove all existing top-level children via DeletePageContent ---
     for child in current_root:
@@ -641,7 +696,8 @@ def _create_page_impl(
         title_el = ET.SubElement(page_el, f"{{{_ONE_NS}}}Title")
         oe_el = ET.SubElement(title_el, f"{{{_ONE_NS}}}OE")
         t_el = ET.SubElement(oe_el, f"{{{_ONE_NS}}}T")
-        t_el.text = title
+        # OneNote reads <one:T> content as HTML.
+        t_el.text = html.escape(title, quote=False)
         title_xml = ET.tostring(page_el, encoding="unicode", xml_declaration=False)
         app.UpdatePageContent(title_xml, 0.0)
     if parent_page_id is not None:
@@ -658,11 +714,14 @@ def _append_page_impl(page_id: str, content_xml: str) -> None:
     for el in content_el.iter():
         el.attrib.pop("objectID", None)
     page_tag = f"{{{_ONE_NS}}}Page"
-    page_el = ET.Element(page_tag)
+    if content_el.tag == page_tag:
+        page_el = content_el
+    else:
+        page_el = ET.Element(page_tag)
+        page_el.append(content_el)
     page_el.set("ID", page_id)
-    page_el.append(content_el)
     serialized = ET.tostring(page_el, encoding="unicode", xml_declaration=False)
-    serialized = _resolve_mcpref_to_data(serialized, app)
+    serialized = _complete_image_sizes(_resolve_mcpref_to_data(serialized, app))
     app.UpdatePageContent(serialized, 0.0)
 
 
@@ -747,8 +806,8 @@ def create_page(
     """Create a blank page in *section_id* and return its new page ID.
 
     If *title* is given, seeds the page with a <one:Title> element.
-    If *parent_page_id* is given, the new page is placed as a sub-page directly
-    under that page (reordered to sit after it, indented one level).
+    If *parent_page_id* is given, the new page becomes the last sub-page of that
+    page (placed after its existing sub-pages, indented one level).
     """
     try:
         return _run_com(
@@ -767,7 +826,8 @@ def replace_page(page_id: str, page_xml: str) -> None:
     attribute is overwritten to match *page_id* before calling
     UpdatePageContent, so callers don't need to manage that detail.
     mcpref handles in <one:Data> elements are resolved to real base64 before
-    the COM call.
+    the COM call, and an image <one:Size> with only width or only height gets
+    the other dimension from the image's aspect ratio.
 
     Implementation note: OneNote UpdatePageContent is an upsert keyed on
     objectID.  To achieve a true replace, this function first issues a
@@ -799,10 +859,11 @@ def append_page(page_id: str, content_xml: str) -> None:
         </one:Outline>
 
     Valid top-level elements include <one:Outline>, <one:Image>, <one:Table>, etc.
+    A <one:Page> without ID appends all of its children instead, e.g. the
+    <one:QuickStyleDef> elements that appended headings refer to.
     All objectID attributes are stripped so OneNote treats the element as new
     content to be added (not an update to an existing element).
-    mcpref handles in <one:Data> elements are resolved to real base64 before
-    the COM call — same as replace_page.
+    mcpref handles and partial image sizes are handled as in replace_page.
     """
     _parse_user_xml(content_xml, "content")
     try:
