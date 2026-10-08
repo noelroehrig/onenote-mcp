@@ -29,7 +29,9 @@ Access restriction
 When the ONENOTE_ALLOWED_NOTEBOOKS environment variable is set (comma-separated
 notebook display names), hierarchy listings only show those notebooks and every
 id-scoped read/write verifies that its target lives inside one of them.  Unset
-or blank means unrestricted.
+means unrestricted; an empty value allows no notebook.  A value that still
+contains an unexpanded ``${...}`` placeholder is a configuration error: guarded
+calls fail with code ``config_error`` and ping reports it.
 """
 
 import base64
@@ -162,6 +164,7 @@ class OneNoteError(Exception):
       timeout        OneNote did not respond within the per-operation deadline.
       backend_error  OneNote returned a COM failure (bad id, locked content, …).
       bad_request    The request itself was malformed (e.g. unknown handle).
+      config_error   The server's environment configuration is invalid.
     """
 
     def __init__(self, message: str, code: str = "backend_error") -> None:
@@ -445,18 +448,37 @@ def _parse_user_xml(xml_str: str, what: str) -> None:
         ) from exc
 
 
+def allowlist_config_error() -> str | None:
+    """Describe why ONENOTE_ALLOWED_NOTEBOOKS is unusable, or None when it is fine.
+
+    A value still containing ``${`` is a placeholder the MCP client did not
+    expand; it names no real notebook, so no guess is made about the intent.
+    """
+    raw = os.environ.get("ONENOTE_ALLOWED_NOTEBOOKS", "")
+    if "${" not in raw:
+        return None
+    return (
+        f"ONENOTE_ALLOWED_NOTEBOOKS={raw!r} contains an unexpanded ${{...}} "
+        "placeholder, so no notebook can be accessed. Set it to comma-separated "
+        "notebook names in the MCP client config and restart the client."
+    )
+
+
 def _allowed_notebooks() -> set[str] | None:
     """Return the set of allowed notebook display names, or None when unrestricted.
 
     Read from the ONENOTE_ALLOWED_NOTEBOOKS environment variable at call time:
-    a comma-separated list of notebook names, e.g. "ClaudeSpike, Mathe 5a".
-    Unset or blank means no restriction.
+    a comma-separated list of notebook names, e.g. "SharedNotebook, Project Notes".
+    Unset means no restriction; an empty value allows no notebook.  Raises
+    OneNoteError(code="config_error") when allowlist_config_error() reports one.
     """
+    error = allowlist_config_error()
+    if error is not None:
+        raise OneNoteError(error, code="config_error")
     raw = os.environ.get("ONENOTE_ALLOWED_NOTEBOOKS")
     if raw is None:
         return None
-    names = {part.strip() for part in raw.split(",") if part.strip()}
-    return names or None
+    return {part.strip() for part in raw.split(",") if part.strip()}
 
 
 def _filter_notebooks_xml(xml: str) -> str:
