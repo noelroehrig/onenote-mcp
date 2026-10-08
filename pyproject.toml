@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onenote-mcp"
-version = "1.0.1"
+version = "1.1.0"
 description = "Local MCP server for reading and editing OneNote desktop pages on Windows via the COM API — no Graph, no cloud auth"
 readme = "README.md"
 license = "MIT"
