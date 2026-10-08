@@ -3,7 +3,8 @@ import pytest
 from pydantic import ValidationError
 from onenote_mcp.models import (
     TextRun, Paragraph, ImagePlaceholder, InlineImage,
-    ListItem, List, Position, Outline, PageContent,
+    ListItem, List, Position, Outline, PageContent, PageOutline, UnsupportedItem,
+    UnsupportedPageObject,
 )
 
 
@@ -131,6 +132,18 @@ def test_image_placeholder_type_literal():
     assert ph.type == "image_placeholder"
 
 
+@pytest.mark.parametrize("size", [{"width": 300.0}, {"height": 150.0}])
+def test_image_placeholder_rejects_a_single_dimension(size):
+    with pytest.raises(ValidationError, match="both 'width' and 'height'"):
+        ImagePlaceholder(type="image_placeholder", description="x", **size)
+
+
+@pytest.mark.parametrize("size", [{"width": 0.0, "height": 10.0}, {"width": 10.0, "height": -1.0}])
+def test_image_placeholder_rejects_sizes_that_are_not_positive(size):
+    with pytest.raises(ValidationError):
+        ImagePlaceholder(type="image_placeholder", description="x", **size)
+
+
 # ---------------------------------------------------------------------------
 # ListItem
 # ---------------------------------------------------------------------------
@@ -173,6 +186,59 @@ def test_list_item_deeply_nested():
     child = ListItem(text="child", children=[grandchild])
     parent = ListItem(text="parent", children=[child])
     assert parent.children[0].children[0].text == "grandchild"
+
+
+def test_list_item_children_tell_sub_items_from_content_items():
+    item = ListItem.model_validate({"text": "step", "children": [
+        {"text": "sub"},
+        {"type": "paragraph", "text": "note"},
+        {"type": "inline_image", "handle": "mcpref:abc"},
+        {"type": "unsupported", "kind": "table"},
+    ]})
+    assert [type(child) for child in item.children] == [ListItem, Paragraph, InlineImage, UnsupportedItem]
+
+
+def test_list_item_children_reject_an_unknown_type():
+    with pytest.raises(ValidationError):
+        ListItem.model_validate({"text": "x", "children": [{"type": "paragrph", "text": "y"}]})
+
+
+# ---------------------------------------------------------------------------
+# Nested children of paragraphs and inline images
+# ---------------------------------------------------------------------------
+
+def test_paragraph_children_default_to_empty():
+    assert Paragraph(type="paragraph", text="x").children == []
+
+
+def test_paragraph_children_accept_any_content_item():
+    p = Paragraph.model_validate({"type": "paragraph", "text": "p", "children": [
+        {"type": "paragraph", "text": "c", "children": [{"type": "paragraph", "text": "gc"}]},
+        {"type": "list", "style": "bullet", "items": [{"text": "x"}]},
+        {"type": "inline_image", "handle": "mcpref:abc", "children": [{"type": "paragraph", "text": "caption"}]},
+    ]})
+    assert [type(child) for child in p.children] == [Paragraph, List, InlineImage]
+    assert p.children[0].children[0].text == "gc"
+    assert p.children[2].children[0].text == "caption"
+
+
+# ---------------------------------------------------------------------------
+# Read-only markers for content the structured tools cannot write
+# ---------------------------------------------------------------------------
+
+def test_unsupported_item_defaults():
+    item = UnsupportedItem(type="unsupported", kind="table")
+    assert (item.text, item.children) == ("", [])
+
+
+@pytest.mark.parametrize("model", [UnsupportedItem, UnsupportedPageObject])
+def test_unsupported_kind_is_restricted(model):
+    with pytest.raises(ValidationError):
+        model.model_validate({"type": "unsupported", "kind": "chart"})
+
+
+def test_page_content_unsupported_defaults_to_empty():
+    assert PageContent(title="t", outlines=[]).unsupported == []
 
 
 # ---------------------------------------------------------------------------
@@ -254,10 +320,18 @@ def test_outline_with_width():
 # ---------------------------------------------------------------------------
 
 def test_page_content():
-    outline = Outline(items=[Paragraph(type="paragraph", text="body")])
+    outline = PageOutline(items=[Paragraph(type="paragraph", text="body")])
     page = PageContent(title="My Page", outlines=[outline])
     assert page.title == "My Page"
     assert len(page.outlines) == 1
+
+
+def test_outline_height_is_read_only():
+    assert "height" in PageOutline.model_fields
+    assert "height" not in Outline.model_fields
+    read = PageOutline(height=120.0, items=[]).model_dump(exclude_defaults=True)
+    assert read == {"height": 120.0, "items": []}
+    assert Outline.model_validate(read).model_dump(exclude_defaults=True) == {"items": []}
 
 
 # ---------------------------------------------------------------------------

@@ -46,6 +46,7 @@ from onenote_mcp.com import (
 )
 from onenote_mcp.models import FloatingImage, Outline, PageContent
 from onenote_mcp.builders import (
+    UNSUPPORTED_PAGE_OBJECT_TAGS,
     build_page_xml, build_append_xml, parse_notebook_skeleton, parse_section_pages, parse_page,
 )
 
@@ -112,12 +113,18 @@ async def validate_handles(handles: list[str]) -> dict:
 
     handles: a list of 'mcpref:...' image handles from a previous get_page.
 
-    Returns {handle: true|false} where true means the handle resolves to image
-    bytes (cached or lazily fetchable) and is safe to pass to replace_page /
-    append_page.  A false result means the handle is stale — re-read the source
-    page with get_page to refresh it.  Fast: no page write is attempted.
+    Returns {handle: true|false} where true means the image bytes are in hand
+    and the handle is safe to pass to replace_page / append_page. Bytes not
+    cached yet are fetched from OneNote now (one image read per handle) and
+    cached. false means the handle is unknown (e.g. from before a server
+    restart) or OneNote no longer has the image: re-read the source page with
+    get_page to refresh handles. A timeout error means OneNote did not answer,
+    not that the handles are stale.
     """
-    return await asyncio.to_thread(_validate_handles_com, handles)
+    try:
+        return await asyncio.to_thread(_validate_handles_com, handles)
+    except (OneNoteError, ValueError) as exc:
+        raise _fail(exc) from exc
 
 
 @_tool()
@@ -176,13 +183,17 @@ async def get_notebooks() -> list[dict]:
 
 @_tool()
 async def list_pages(section_id: str) -> list[dict]:
-    """Return the pages of a single section as [{"id": ..., "name": ...}].
+    """Return the pages of a single section as [{"id": ..., "name": ..., "level": 1}].
 
     section_id: a section id from get_notebooks().
 
     Returns only that section's pages — not the whole notebook — so it stays
     small regardless of how many other sections exist. Pass a returned page id
     to get_page, replace_page, or append_page.
+
+    The list is in section order. level is 1 for a top-level page and higher
+    for subpages: a page's subpages are the pages that follow it with a higher
+    level, up to the next page at its own level or lower.
     """
     try:
         xml = await asyncio.to_thread(_list_pages_com, section_id)
@@ -232,17 +243,24 @@ async def get_page(page_id: str, include_binary: bool = False) -> dict:
         {
           "position": {"x": 36.0, "y": 86.4},
           "width": 500.0,
+          "height": 240.0,
           "items": [
             {"type": "paragraph", "text": "Plain body text"},
             {"type": "paragraph", "text": "A heading", "style": "h2", "bold": true},
+            {"type": "paragraph", "text": "Parent", "children": [
+              {"type": "paragraph", "text": "Indented under Parent"}]},
             {"type": "list", "style": "bullet", "items": [{"text": "Item 1"}]},
-            {"type": "inline_image", "handle": "mcpref:abc...", "width": 300.0, "height": 200.0}
+            {"type": "inline_image", "handle": "mcpref:abc...", "width": 300.0, "height": 200.0},
+            {"type": "unsupported", "kind": "table", "text": "Name | Age\\nAda | 36"}
           ]
         }
       ],
       "images": [
         {"handle": "mcpref:abc123", "width": 300.0, "height": 200.0,
          "position": {"x": 36.0, "y": 156.0, "z": 1}}
+      ],
+      "unsupported": [
+        {"kind": "ink", "position": {"x": 400.0, "y": 120.0}, "width": 180.0, "height": 60.0}
       ]
     }
 
@@ -250,15 +268,35 @@ async def get_page(page_id: str, include_binary: bool = False) -> dict:
     always means the default from the replace_page schema — style="normal",
     bold/italic/underline/strikethrough=false, color/highlight/font_size/
     font_family unset, position/width unset (auto-placed), no children, no
-    floating images. So a plain paragraph is just {"type": "paragraph",
-    "text": "..."} and any styling you DO see is really on the page.
+    floating images, no unsupported objects. So a plain paragraph is just
+    {"type": "paragraph", "text": "..."} and any styling you DO see is really
+    on the page.
+
+    An outline's "height" is read-only: its height in points as OneNote
+    measured it, e.g. to find free space below it. replace_page and
+    append_page ignore it.
 
     Floating images, when present, appear in the top-level `images` list.
     Pass content["images"] verbatim to replace_page's `images` parameter to
     preserve them when rewriting a page (omit it if absent).
 
+    UNSUPPORTED CONTENT: tables, handwriting and drawings (ink), attached
+    files, audio/video recordings and content from newer OneNote versions
+    cannot be written by the structured tools. Inside outlines they appear as
+    read-only {"type": "unsupported", "kind": ..., "text": ...} items; "kind"
+    is table, ink, file, media or unknown, and "text" holds their readable
+    text when OneNote provides it (table cells one row per line, separated by
+    " | "; recognized handwriting; a file's name). replace_page and
+    append_page reject a payload that still contains such an item, because
+    rewriting the page would delete that content: remove the item from the
+    payload deliberately only if deleting it is intended. Objects placed
+    directly on the canvas (e.g. handwriting) are listed in the top-level
+    `unsupported` list instead. replace_page keeps them in place at their
+    position, so place new content where it does not overlap them.
+
     The returned structure is directly compatible with replace_page — you can read a
     page, modify its outlines, and pass outlines + images straight to replace_page.
+    Unsupported content is the exception, see above.
     """
     try:
         xml = await asyncio.to_thread(_get_page_com, page_id, include_binary)
@@ -345,26 +383,24 @@ async def replace_page_xml(page_id: str, page_xml: str) -> str:
 
     MANUAL-INSERT PLACEHOLDER
     When the user has asked for a screenshot that does not yet exist in OneNote,
-    do NOT invent a mcpref handle or image bytes. Instead emit a
-    highlighted callout positioned and sized to match where the screenshot will go:
+    do NOT invent a mcpref handle or image bytes. Write a placeholder instead,
+    preferably as an image_placeholder item with replace_page or append_page,
+    which generate the box image. It is the same in raw XML: a label OE, then a
+    box OE whose light image reserves exactly width x height points:
 
-        <one:Outline>
-          <one:Position x="36.0" y="86.4" z="0"/>
-          <one:Size width="500.0" height="400.0"/>
-          <one:OEChildren>
-            <one:OE alignment="left">
-              <one:T><![CDATA[<span style="background:#ffeb3b;color:#222;font-weight:bold;padding:4px 8px;border:2px dashed #b07500;">[INSERT IMAGE: <short description of what goes here>]</span>]]></one:T>
-            </one:OE>
-          </one:OEChildren>
-        </one:Outline>
+        <one:OE><one:Meta name="onenote-mcp.image-placeholder" content="label"/>
+          <one:T><![CDATA[<span style="font-weight:bold;background:#FFEB3B">Description</span>]]></one:T></one:OE>
+        <one:OE><one:Meta name="onenote-mcp.image-placeholder" content="box"/>
+          <one:Image alt="Image placeholder"><one:Size width="500.0" height="400.0" isSetByUser="true"/>
+            <one:Data>base64 PNG</one:Data></one:Image></one:OE>
 
-    Position: read the existing page XML (get_page) to find where surrounding
-    content sits, then set x/y so the placeholder lands exactly where the
-    screenshot will be pasted. OneNote coordinates are in points (1 pt = 1/72 in).
-    Size: set width/height to match the expected screenshot dimensions so the
-    placeholder occupies the same space the final image will fill.
-    Description: [INSERT IMAGE: ...] must name the expected content
-    (book page, figure number, context) so the user knows which screenshot to paste.
+    The Meta elements and the alt text make get_page read the two OEs back as
+    one image_placeholder item. Leave out the box OE for a label alone.
+    Description: name the expected content (book page, figure number,
+    context) in the user's language, so the user knows which screenshot to paste.
+    Position: set the outline's x/y (points, 1 pt = 1/72 in) so the placeholder
+    lands where the screenshot will be pasted; get_page shows where the other
+    content sits.
     """
     try:
         await asyncio.to_thread(_replace_page_com, page_id, page_xml)
@@ -425,11 +461,21 @@ async def replace_page(page_id: str, title: str, outlines: list[Outline], images
                 - {"type": "list", "style": "bullet|numbered", "items": [...]}
                 - {"type": "image_placeholder", "description": "what to paste here",
                    "width": ..., "height": ...}
-                  → generates a yellow highlight callout; the user pastes the screenshot
-                    on top of it after viewing the page.
+                  → for a screenshot the user pastes in later: the description,
+                    verbatim and in the user's language, as a highlighted label
+                    above a light box of exactly width x height points (give
+                    both, or neither for the label alone).
                 - {"type": "inline_image", "handle": "mcpref:...", "width": ..., "height": ...}
                   → an image embedded inside the outline (e.g. a pasted screenshot).
                     Use the handle verbatim from a get_page response.
+              Paragraphs and inline images take optional "children": items
+              indented one level under them. A list item's "children" holds
+              sub-items (objects without "type") for deeper list levels and
+              any other item (with "type") for other indented content.
+              Items of type "unsupported" (from get_page) are read-only and
+              rejected with bad_request: they stand for content such as
+              tables or handwriting that this tool cannot write, so remove
+              them from the payload only if deleting that content is intended.
     images: optional list of FloatingImage objects positioned directly on the page canvas.
             These are peers of outlines, NOT nested inside them. Each image must have a
             handle from get_page (starts with 'mcpref:'). Pass content.images from a
@@ -437,11 +483,14 @@ async def replace_page(page_id: str, title: str, outlines: list[Outline], images
             None if the page has no floating images.
 
     Returns "ok" on success.
-    Note: all existing page content is deleted before the new content is written.
+    Note: all existing page content is deleted before the new content is written,
+    except the objects in get_page's top-level `unsupported` list (e.g.
+    handwriting on the canvas): they stay in place at their position, so place
+    new content where it does not overlap them.
     """
     try:
         page_xml = build_page_xml(title, outlines, images)
-        await asyncio.to_thread(_replace_page_com, page_id, page_xml)
+        await asyncio.to_thread(_replace_page_com, page_id, page_xml, UNSUPPORTED_PAGE_OBJECT_TAGS)
         return "ok"
     except (OneNoteError, ValueError) as exc:
         raise _fail(exc) from exc
@@ -458,6 +507,8 @@ async def append_page(page_id: str, outline: Outline) -> str:
              Existing page content is preserved.
              Outline items may be paragraph, list, image, or image_placeholder
              — see replace_page for the full item schema.
+             Items of type "unsupported" are rejected with bad_request, as
+             in replace_page.
 
     Returns "ok" on success.
     """

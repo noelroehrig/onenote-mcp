@@ -149,7 +149,7 @@ tools even though OneNote itself is reachable.
 | Tool | What it does |
 | --- | --- |
 | `get_notebooks` | Open notebooks with their sections (no pages): the small navigation skeleton. |
-| `list_pages` | The pages of one section as `{id, name}` pairs. |
+| `list_pages` | The pages of one section in section order, as `{id, name, level}`. `level` is 1 for a top-level page; a page's subpages are the pages that follow it with a higher level. |
 
 The intended flow: `get_notebooks` → pick a section → `list_pages(section_id)` →
 pick a page → read/write tools below.
@@ -158,17 +158,17 @@ pick a page → read/write tools below.
 
 | Tool | What it does |
 | --- | --- |
-| `get_page` | A page as structured JSON: paragraphs, headings, lists, inline and floating images. Image bytes are **not** included; images carry compact `mcpref:` handles instead. |
+| `get_page` | A page as structured JSON: paragraphs, headings, lists, indented content, inline and floating images, plus read-only markers for [content the structured tools cannot write](#content-the-structured-tools-cannot-write). Image bytes are **not** included; images carry compact `mcpref:` handles instead. |
 | `get_image_data` | The base64 bytes for a single image handle, fetched on demand. |
-| `validate_handles` | Check whether image handles are still writable, without writing anything. |
+| `validate_handles` | Check whether image handles are still writable, without writing anything. Fetches and caches the bytes of handles not cached yet, so `true` means the bytes are in hand; `false` means the handle is unknown or OneNote no longer has the image. |
 
 ### Writing
 
 | Tool | What it does |
 | --- | --- |
 | `create_page` | Create a page in a section, optionally as a sub-page of an existing page. Returns the new page id. |
-| `replace_page` | Replace a page's entire content from structured JSON (outlines + floating images). |
-| `append_page` | Append one structured content block to an existing page, preserving current content. |
+| `replace_page` | Replace a page's entire content from structured JSON (outlines + floating images). Rejects read-only `unsupported` items and keeps page-level objects it cannot write in place, see below. |
+| `append_page` | Append one structured content block to an existing page, preserving current content. Rejects read-only `unsupported` items. |
 
 ### Health
 
@@ -203,6 +203,27 @@ position. This keeps reads of image-heavy pages small and fast.
   stale (e.g. after a restart), re-read the source page with `get_page` to mint
   fresh ones.
 
+## Content the structured tools cannot write
+
+Tables, handwriting and drawings (ink), attached files, audio/video recordings and
+content from newer OneNote versions have no structured item type. `get_page` still
+reports them, so nothing disappears unnoticed:
+
+- Inside an outline, each becomes a read-only item such as
+  `{"type": "unsupported", "kind": "table", "text": "Name | Age\nAda | 36"}`.
+  `kind` is `table`, `ink`, `file`, `media` or `unknown`; `text` is the readable
+  text when OneNote provides it (table cells one row per line, recognized
+  handwriting, a file's name).
+- Objects placed directly on the page canvas, such as handwriting, are listed in
+  the top-level `unsupported` list with their kind, position and size.
+
+`replace_page` and `append_page` reject a payload that still contains an
+`unsupported` item with `bad_request`, because rewriting the page would delete that
+content. Remove the item deliberately only if deleting it is intended. The page-level
+`unsupported` objects cannot be passed back at all, so `replace_page` keeps them in
+place at their position: place new content where it does not overlap them.
+`replace_page_xml` still replaces everything, since its caller supplies the full page.
+
 ## Error codes
 
 Tool errors start with a machine-readable code so clients can react without parsing prose:
@@ -213,6 +234,7 @@ Tool errors start with a machine-readable code so clients can react without pars
 | `backend_error` | OneNote returned a COM failure (bad id, locked content, …). |
 | `bad_request` | The request itself was invalid (unknown image handle, malformed content, …). |
 | `config_error` | The server's configuration is invalid, e.g. `ONENOTE_ALLOWED_NOTEBOOKS` still contains an unexpanded `${...}` placeholder. Fix the MCP client config and restart; `ping` shows the message. |
+| `partial_write` | A replace wrote the new content, but some old page objects could not be deleted and are still on the page. The message lists each one's kind, object id and hresult. Read the page with `get_page` and decide how to handle them instead of retrying the replace. |
 
 ## Configuration
 

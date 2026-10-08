@@ -5,12 +5,17 @@ validation, and OneNoteError code semantics — all without a live COM call.
 A tiny fake ``app`` stands in for OneNote.Application where GetBinaryPageContent
 is needed.
 """
+import threading
 import xml.etree.ElementTree as ET
 import pytest
 
 _ONE_NS = "http://schemas.microsoft.com/office/onenote/2013/onenote"
+_BINARY_OBJECT_DOES_NOT_EXIST = -2147213297  # 0x8004200F, hrBinaryObjectDoesNotExist
+_APP_IN_MODAL_UI = -2147213264  # 0x80042030, hrAppInModalUI
 
 try:
+    import comtypes
+    from onenote_mcp import com
     from onenote_mcp.com import (
         _strip_callbacks_to_mcpref,
         _resolve_handle_bytes,
@@ -46,12 +51,16 @@ class _FakeApp:
     """Minimal stand-in for OneNote.Application.GetBinaryPageContent."""
 
     def __init__(self, mapping):
-        self._mapping = mapping  # (page_id, callback_id) -> base64 str
+        # (page_id, callback_id) -> base64 str, or None for an image OneNote no longer has
+        self._mapping = mapping
         self.calls = []
 
     def GetBinaryPageContent(self, page_id, callback_id):
         self.calls.append((page_id, callback_id))
-        return self._mapping[(page_id, callback_id)]
+        data = self._mapping[(page_id, callback_id)]
+        if data is None:
+            raise comtypes.COMError(_BINARY_OBJECT_DOES_NOT_EXIST, "missing", None)
+        return data
 
 
 def _no_binary_image_xml(callback_id: str, *, with_size=True) -> str:
@@ -156,7 +165,13 @@ def test_resolve_mcpref_to_data_uses_app_for_source_handles():
 # validate_handles
 # ---------------------------------------------------------------------------
 
-def test_validate_handles_reports_cached_source_and_unknown():
+def _use_app(monkeypatch, app) -> None:
+    monkeypatch.setattr(com, "_app", lambda: app)
+
+
+def test_validate_handles_reports_cached_fetched_and_unknown(monkeypatch):
+    app = _FakeApp({("{P}", "{CB}"): "BYTES=="})
+    _use_app(monkeypatch, app)
     _IMAGE_CACHE["cached00aaaa"] = "bytes"
     _HANDLE_SOURCES["source00bbbb"] = ("{P}", "{CB}")
     result = validate_handles([
@@ -171,6 +186,74 @@ def test_validate_handles_reports_cached_source_and_unknown():
         "mcpref:unknown00cccc": False,
         "source00bbbb": True,
     }
+    assert app.calls == [("{P}", "{CB}")], "each source-only handle is fetched once"
+
+
+def test_validate_handles_caches_the_fetched_bytes(monkeypatch):
+    app = _FakeApp({("{P}", "{CB}"): "BYTES=="})
+    _use_app(monkeypatch, app)
+    _HANDLE_SOURCES["source00bbbb"] = ("{P}", "{CB}")
+
+    assert validate_handles(["mcpref:source00bbbb"]) == {"mcpref:source00bbbb": True}
+    assert _IMAGE_CACHE["source00bbbb"] == "BYTES=="
+    assert validate_handles(["mcpref:source00bbbb"]) == {"mcpref:source00bbbb": True}
+    assert len(app.calls) == 1
+
+
+def test_validate_handles_false_when_onenote_no_longer_has_the_image(monkeypatch):
+    _use_app(monkeypatch, _FakeApp({("{P}", "{GONE}"): None, ("{P}", "{CB}"): "BYTES=="}))
+    _HANDLE_SOURCES["removed0aaaa"] = ("{P}", "{GONE}")
+    _HANDLE_SOURCES["present0bbbb"] = ("{P}", "{CB}")
+
+    result = validate_handles(["mcpref:removed0aaaa", "mcpref:present0bbbb"])
+    assert result == {"mcpref:removed0aaaa": False, "mcpref:present0bbbb": True}
+    assert "removed0aaaa" not in _IMAGE_CACHE
+
+
+def test_validate_handles_raises_other_com_failures_instead_of_reporting_false(monkeypatch):
+    class _ModalApp:
+        def GetBinaryPageContent(self, page_id, callback_id):
+            raise comtypes.COMError(_APP_IN_MODAL_UI, "modal dialog", None)
+
+    _use_app(monkeypatch, _ModalApp())
+    _HANDLE_SOURCES["source00bbbb"] = ("{P}", "{CB}")
+
+    with pytest.raises(OneNoteError) as exc:
+        validate_handles(["mcpref:source00bbbb"])
+    assert exc.value.code == "backend_error"
+
+
+def test_validate_handles_needs_no_onenote_for_cached_and_unknown_handles(monkeypatch):
+    def no_onenote():
+        raise AssertionError("OneNote must not be called")
+
+    monkeypatch.setattr(com, "_app", no_onenote)
+    _IMAGE_CACHE["cached00aaaa"] = "bytes"
+    assert validate_handles(["mcpref:cached00aaaa", "mcpref:unknown00cccc"]) == {
+        "mcpref:cached00aaaa": True,
+        "mcpref:unknown00cccc": False,
+    }
+
+
+def test_validate_handles_raises_a_timeout_instead_of_reporting_false(monkeypatch):
+    released = threading.Event()
+
+    class _WedgedApp:
+        def GetBinaryPageContent(self, page_id, callback_id):
+            # Fails without caching once released, so the abandoned worker
+            # leaves nothing behind for later tests.
+            released.wait(5)
+            raise comtypes.COMError(_BINARY_OBJECT_DOES_NOT_EXIST, "released", None)
+
+    _use_app(monkeypatch, _WedgedApp())
+    monkeypatch.setattr(com, "READ_TIMEOUT", 0.2)
+    _HANDLE_SOURCES["wedged00cccc"] = ("{P}", "{CB}")
+    try:
+        with pytest.raises(OneNoteError) as exc:
+            validate_handles(["mcpref:wedged00cccc"])
+        assert exc.value.code == "timeout"
+    finally:
+        released.set()
 
 
 # ---------------------------------------------------------------------------
