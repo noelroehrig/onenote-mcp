@@ -32,6 +32,7 @@ from mcp.server.fastmcp import FastMCP
 
 from onenote_mcp.com import (
     OneNoteError,
+    allowlist_config_error as _allowlist_config_error_com,
     ping as _ping_com,
     validate_handles as _validate_handles_com,
     get_image_data as _get_image_data_com,
@@ -85,15 +86,24 @@ async def ping() -> dict:
     apart from "the server is down".
 
     Returns:
-      {"server": "ok", "onenote_responsive": true|false}
+      {"server": "ok", "onenote_responsive": true|false, "config_error": null|"<message>"}
 
     onenote_responsive is false when OneNote does not answer a lightweight call
     within the ping timeout (it is likely showing a modal dialog or syncing).
     When false, page reads/writes will also time out until OneNote recovers —
     dismiss any open OneNote dialog and retry.
+
+    config_error is set when the server's configuration is invalid, e.g. an
+    unexpanded ${...} placeholder in ONENOTE_ALLOWED_NOTEBOOKS.  OneNote can
+    still be responsive, but the notebook tools fail with config_error until the
+    configuration is fixed.  Show the message to the user.
     """
     responsive = await asyncio.to_thread(_ping_com)
-    return {"server": "ok", "onenote_responsive": responsive}
+    return {
+        "server": "ok",
+        "onenote_responsive": responsive,
+        "config_error": _allowlist_config_error_com(),
+    }
 
 
 @_tool()
@@ -148,7 +158,7 @@ async def get_notebooks() -> list[dict]:
     ]
 
     Workflow:
-      1. get_notebooks() — find the section you want (e.g. "Vorlagen") and its id.
+      1. get_notebooks() — find the section you want (e.g. "Templates") and its id.
       2. list_pages(section_id=<id>) — list just that section's pages.
       3. get_page / replace_page / append_page with a page id from step 2.
     Use a section id with create_page; use a page id with get_page/replace_page.

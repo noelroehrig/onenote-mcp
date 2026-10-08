@@ -136,8 +136,11 @@ Any MCP client that starts stdio servers works the same way: use the `command`,
 
 OneNote desktop must be running (or startable) with at least one notebook open.
 Restart Claude Desktop; the OneNote tools should appear in the tools list. Then ask
-Claude to call the `ping` tool: `{"server": "ok", "onenote_responsive": true}` means
-the server, the COM bridge and OneNote are all talking to each other.
+Claude to call the `ping` tool: `{"server": "ok", "onenote_responsive": true, "config_error": null}`
+means the server, the COM bridge and OneNote are all talking to each other. A
+non-null `config_error` names a configuration problem (such as an unexpanded
+`${...}` placeholder in `ONENOTE_ALLOWED_NOTEBOOKS`) that blocks the notebook
+tools even though OneNote itself is reachable.
 
 ## Tools
 
@@ -171,7 +174,7 @@ pick a page → read/write tools below.
 
 | Tool | What it does |
 | --- | --- |
-| `ping` | Fast health check: is the server alive, and is OneNote responding? Works even while another call is stuck on a wedged OneNote. |
+| `ping` | Fast health check: is the server alive, is OneNote responding, and is a configuration error blocking the notebook tools? Works even while another call is stuck on a wedged OneNote. |
 
 ### Raw-XML escape hatches
 
@@ -209,6 +212,7 @@ Tool errors start with a machine-readable code so clients can react without pars
 | `timeout` | OneNote did not respond within the per-operation deadline, most likely because it is showing a modal dialog or syncing. Dismiss any dialog and retry; `ping` tells you when it has recovered. |
 | `backend_error` | OneNote returned a COM failure (bad id, locked content, …). |
 | `bad_request` | The request itself was invalid (unknown image handle, malformed content, …). |
+| `config_error` | The server's configuration is invalid, e.g. `ONENOTE_ALLOWED_NOTEBOOKS` still contains an unexpanded `${...}` placeholder. Fix the MCP client config and restart; `ping` shows the message. |
 
 ## Configuration
 
@@ -217,7 +221,7 @@ the Claude Desktop server entry if needed):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ONENOTE_ALLOWED_NOTEBOOKS` | _(unset: no restriction)_ | Comma-separated notebook names, e.g. `SharedNotebook, Project Notes`. When set, all other notebooks are invisible and untouchable: they are hidden from notebook listings and every read/write against their sections or pages is rejected. |
+| `ONENOTE_ALLOWED_NOTEBOOKS` | _(unset: no restriction)_ | Comma-separated notebook names, e.g. `SharedNotebook, Project Notes`. When set, all other notebooks are invisible and untouchable: they are hidden from notebook listings and every read/write against their sections or pages is rejected. An empty value allows no notebook. A value that still contains `${` (a placeholder the client did not expand) is a configuration error: notebook tools fail with `config_error` and `ping` reports it. |
 | `ONENOTE_READ_TIMEOUT` | `20` | Timeout (s) for page/hierarchy reads and image fetches. |
 | `ONENOTE_WRITE_TIMEOUT` | `25` | Timeout (s) for page creates and writes. |
 | `ONENOTE_PING_TIMEOUT` | `8` | Timeout (s) for the `ping` health probe. |

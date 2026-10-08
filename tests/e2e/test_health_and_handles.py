@@ -24,6 +24,7 @@ def test_ping_reports_server_and_onenote(mcp_session):
     assert result["server"] == "ok"
     # The e2e suite only runs when OneNote is reachable, so it must be responsive.
     assert result["onenote_responsive"] is True
+    assert result["config_error"] is None
 
 
 @pytest.mark.e2e
