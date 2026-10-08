@@ -62,6 +62,39 @@ def test_validate_handles_true_for_fresh_false_for_bogus(mcp_session, claudespik
 
 
 @pytest.mark.e2e
+def test_validate_handles_false_for_an_image_removed_from_its_page(mcp_session, claudespike_section_id):
+    """A handle read without bytes is not writable once replace_page removed its
+    image: OneNote no longer returns the bytes (hrBinaryObjectDoesNotExist)."""
+    title = "test_validate_removed_image_auto"
+    page_id = mcp_session.call_tool("create_page", {
+        "section_id": claudespike_section_id,
+        "title": title,
+    })
+    page_xml = (
+        f'<one:Page {_XMLNS}>'
+        f'<one:Title><one:OE><one:T>{title}</one:T></one:OE></one:Title>'
+        f'<one:Outline><one:OEChildren><one:OE><one:Image>'
+        f'<one:Size width="100.0" height="80.0" isSetByUser="true"/>'
+        f'<one:Data>{_TINY_PNG_BASE64}</one:Data>'
+        f'</one:Image></one:OE></one:OEChildren></one:Outline>'
+        f'</one:Page>'
+    )
+    assert mcp_session.call_tool("replace_page_xml", {"page_id": page_id, "page_xml": page_xml}) == "ok"
+    (image,) = mcp_session.call_tool("get_page", {"page_id": page_id})["outlines"][0]["items"]
+    assert image["type"] == "inline_image"
+
+    assert mcp_session.call_tool("replace_page", {
+        "page_id": page_id,
+        "title": title,
+        "outlines": [{"items": [{"type": "paragraph", "text": "the image is gone"}]}],
+    }) == "ok"
+
+    assert mcp_session.call_tool("validate_handles", {"handles": [image["handle"]]}) == {
+        image["handle"]: False,
+    }
+
+
+@pytest.mark.e2e
 def test_get_image_data_returns_base64(mcp_session, claudespike_section_id):
     """get_image_data fetches the bytes for a handle read with the no-binary default."""
     title = "test_get_image_data_auto"

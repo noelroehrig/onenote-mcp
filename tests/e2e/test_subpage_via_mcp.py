@@ -54,6 +54,15 @@ def test_create_page_as_subpage_indents_and_appends_last(mcp_session, claudespik
     # parent, then first child, then the SECOND child appended after it (last).
     assert i_parent < i_c1 < i_c2, f"expected parent<child1<child2, got {order}"
 
+    # list_pages reports the same order and the levels: the subpages are the
+    # pages right after the parent with a higher level.
+    pages = mcp_session.call_tool("list_pages", {"section_id": claudespike_section_id})
+    ids = [page["id"] for page in pages]
+    start = ids.index(parent_id)
+    assert [(page["id"], page["level"]) for page in pages[start:start + 3]] == [
+        (parent_id, 1), (child1, 2), (child2, 2),
+    ]
+
 
 @pytest.mark.e2e
 def test_create_page_unknown_parent_returns_bad_request(mcp_session, claudespike_section_id):

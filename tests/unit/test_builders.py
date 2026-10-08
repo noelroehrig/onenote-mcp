@@ -1,15 +1,18 @@
 """Unit tests for onenote_mcp.builders — no COM dependency."""
+import base64
 import xml.etree.ElementTree as ET
+import zlib
 import pytest
 from onenote_mcp.builders import (
     _run_to_html, _paragraph_html, _cdata_placeholder, _apply_cdata,
     build_page_xml, build_append_xml,
     parse_page,
-    _clean_text, _floating_image_to_el,
+    _box_pixel_size, _box_png, _clean_text, _floating_image_to_el,
 )
+from onenote_mcp.images import pixel_size
 from onenote_mcp.models import (
     TextRun, Paragraph, ImagePlaceholder, InlineImage, ListItem, List,
-    FloatingImage, Outline, Position, PageContent,
+    FloatingImage, Outline, Position, PageContent, UnsupportedItem,
 )
 
 _NS = {"one": "http://schemas.microsoft.com/office/onenote/2013/onenote"}
@@ -287,7 +290,8 @@ def test_build_page_xml_image_placeholder_cdata():
     ph = ImagePlaceholder(type="image_placeholder", description="Screenshot of dashboard")
     outline = Outline(items=[ph])
     xml = build_page_xml("Title", [outline])
-    assert "[INSERT IMAGE:" in xml
+    assert '<![CDATA[<span style="font-weight:bold;background:#FFEB3B">Screenshot of dashboard</span>]]>' in xml
+    assert "INSERT IMAGE" not in xml
 
 
 def test_build_page_xml_outline_position():
@@ -426,18 +430,33 @@ def test_parse_notebook_skeleton_empty():
     assert parse_notebook_skeleton(xml) == []
 
 
-def test_parse_section_pages_returns_id_and_name():
+def test_parse_section_pages_returns_id_name_and_level():
     xml = (
         '<one:Section xmlns:one="http://schemas.microsoft.com/office/onenote/2013/onenote"'
         ' ID="sec1" name="Templates">'
-        '<one:Page ID="p1" name="Template A"/>'
+        '<one:Page ID="p1" name="Template A" pageLevel="1"/>'
         '<one:Page ID="p2" name="Template B"/>'
         '</one:Section>'
     )
     from onenote_mcp.builders import parse_section_pages
     assert parse_section_pages(xml) == [
-        {"id": "p1", "name": "Template A"},
-        {"id": "p2", "name": "Template B"},
+        {"id": "p1", "name": "Template A", "level": 1},
+        {"id": "p2", "name": "Template B", "level": 1},
+    ]
+
+
+def test_parse_section_pages_keeps_section_order_and_subpage_levels():
+    xml = (
+        '<one:Section xmlns:one="http://schemas.microsoft.com/office/onenote/2013/onenote" ID="sec1">'
+        '<one:Page ID="parent" name="Parent" pageLevel="1"/>'
+        '<one:Page ID="child" name="Child" pageLevel="2" isSubPage="true"/>'
+        '<one:Page ID="grandchild" name="Grandchild" pageLevel="3" isSubPage="true"/>'
+        '<one:Page ID="next" name="Next" pageLevel="1"/>'
+        '</one:Section>'
+    )
+    from onenote_mcp.builders import parse_section_pages
+    assert [(page["id"], page["level"]) for page in parse_section_pages(xml)] == [
+        ("parent", 1), ("child", 2), ("grandchild", 3), ("next", 1),
     ]
 
 
@@ -466,6 +485,13 @@ def test_parse_page_title():
     )
     page = parse_page(xml)
     assert page.title == "My Title"
+
+
+def test_parse_page_title_joins_several_t_elements():
+    xml = _page_xml(
+        '<one:Title><one:OE><one:T>My </one:T><one:T selected="all"></one:T><one:T>Title</one:T></one:OE></one:Title>'
+    )
+    assert parse_page(xml).title == "My Title"
 
 
 def test_parse_page_empty_outlines():
@@ -631,6 +657,17 @@ def test_parse_page_width():
     )
     page = parse_page(xml)
     assert page.outlines[0].width == 250.0
+
+
+def test_parse_page_reports_the_measured_outline_height():
+    xml = _page_xml(
+        '<one:Outline>'
+        '  <one:Size width="93.8" height="134.27"/>'
+        '  <one:OEChildren><one:OE><one:T>content</one:T></one:OE></one:OEChildren>'
+        '</one:Outline>'
+    )
+    outline = parse_page(xml).model_dump(exclude_defaults=True)["outlines"][0]
+    assert (outline["width"], outline["height"]) == (93.8, 134.27)
 
 
 def test_parse_page_h1_resolved_via_qsd_table():
@@ -1228,10 +1265,10 @@ def test_special_text_round_trips_in_title(text):
     assert parse_page(build_page_xml(text, [])).title == text
 
 
-def test_special_text_round_trips_in_image_placeholder():
-    ph = ImagePlaceholder(type="image_placeholder", description="<b> & ]]>")
-    p = _first_item(Outline(items=[ph]))
-    assert p.text == "[INSERT IMAGE: <b> & ]]>]"
+@pytest.mark.parametrize("text", _SPECIAL_TEXTS)
+def test_special_text_round_trips_in_image_placeholder(text):
+    ph = ImagePlaceholder(type="image_placeholder", description=text, width=40.0, height=30.0)
+    assert _first_item(Outline(items=[ph])) == ph
 
 
 def test_t_content_is_escaped_html():
@@ -1303,3 +1340,558 @@ def test_parse_unsupported_font_family_is_left_out():
     p = _styled_paragraph("font-family:ＭＳ ゴシック")
     assert p.text == "styled"
     assert p.font_family is None
+
+
+# ---------------------------------------------------------------------------
+# Paragraph formatting from the OE and <one:T> style attributes: OneNote moves
+# paragraph-wide formatting there, spans inside <one:T> override it per run.
+# ---------------------------------------------------------------------------
+
+_P_QSD = (
+    '<one:QuickStyleDef index="0" name="p" fontColor="automatic" '
+    'highlightColor="automatic" font="Calibri" fontSize="11.0"/>'
+)
+_H1_QSD = (
+    '<one:QuickStyleDef index="1" name="h1" fontColor="#1E4E79" '
+    'highlightColor="automatic" font="Calibri" fontSize="16.0" bold="true"/>'
+)
+_BULLET = '<one:List><one:Bullet bullet="2"/></one:List>'
+
+
+def _outline_xml(*oes: str, defs: str = "") -> str:
+    return _page_xml(defs, "<one:Outline><one:OEChildren>", *oes, "</one:OEChildren></one:Outline>")
+
+
+def _items(*oes: str, defs: str = "") -> list[dict]:
+    """Parse *oes* as one outline and return its items as get_page reports them."""
+    page = parse_page(_outline_xml(*oes, defs=defs))
+    return page.model_dump(exclude_defaults=True)["outlines"][0]["items"]
+
+
+def _reread(page: PageContent) -> PageContent:
+    """Write *page* back as replace_page would and read the result again."""
+    return parse_page(build_page_xml(page.title, page.outlines, page.images))
+
+
+def test_parse_paragraph_reads_oe_style():
+    assert _items('<one:OE style="font-size:22.0pt"><one:T>x</one:T></one:OE>') == [
+        {"type": "paragraph", "text": "x", "font_size": 22.0},
+    ]
+
+
+def test_parse_paragraph_reads_t_style():
+    assert _items('<one:OE><one:T style="color:#C00000">x</one:T></one:OE>') == [
+        {"type": "paragraph", "text": "x", "color": "#C00000"},
+    ]
+
+
+def test_parse_paragraph_oe_style_combines_with_uniform_span():
+    items = _items(
+        '<one:OE style="color:#9C0000;font-family:Courier New">'
+        "<one:T><![CDATA[<span style='font-weight:bold;background:#FFFF00'>x</span>]]></one:T></one:OE>"
+    )
+    assert items == [{
+        "type": "paragraph", "text": "x", "bold": True, "color": "#9C0000",
+        "highlight": "#FFFF00", "font_family": "Courier New",
+    }]
+
+
+def test_parse_paragraph_span_overrides_oe_style_per_run():
+    items = _items(
+        '<one:OE style="color:#C00000;font-family:Courier New">'
+        "<one:T><![CDATA[<span style='color:#0000FF'>blue</span> red]]></one:T></one:OE>"
+    )
+    assert items == [{"type": "paragraph", "segments": [
+        {"text": "blue", "color": "#0000FF", "font_family": "Courier New"},
+        {"text": " red", "color": "#C00000", "font_family": "Courier New"},
+    ]}]
+
+
+def test_parse_paragraph_span_can_switch_off_oe_formatting():
+    items = _items(
+        '<one:OE style="font-weight:bold;font-style:italic;text-decoration:underline"><one:T><![CDATA['
+        "bold <span style='font-weight:normal;font-style:normal;text-decoration:none'>plain</span>"
+        "]]></one:T></one:OE>"
+    )
+    assert items == [{"type": "paragraph", "segments": [
+        {"text": "bold ", "bold": True, "italic": True, "underline": True},
+        {"text": "plain"},
+    ]}]
+
+
+def test_parse_paragraph_joins_several_t_elements():
+    items = _items(
+        '<one:OE><one:T>Hello </one:T><one:T style="font-weight:bold">big</one:T><one:T> world</one:T></one:OE>'
+    )
+    assert items == [{"type": "paragraph", "segments": [
+        {"text": "Hello "}, {"text": "big", "bold": True}, {"text": " world"},
+    ]}]
+
+
+def test_parse_paragraph_style_repeating_its_quick_style_reads_as_plain():
+    items = _items(
+        '<one:OE quickStyleIndex="0" style="font-family:Calibri;font-size:11.0pt"><one:T>x</one:T></one:OE>',
+        defs=_P_QSD,
+    )
+    assert items == [{"type": "paragraph", "text": "x"}]
+
+
+def test_parse_paragraph_reports_formatting_beyond_its_quick_style():
+    items = _items(
+        '<one:OE quickStyleIndex="0" style="font-family:Arial;font-size:11.0pt"><one:T>x</one:T></one:OE>',
+        defs=_P_QSD,
+    )
+    assert items == [{"type": "paragraph", "text": "x", "font_family": "Arial"}]
+
+
+def test_parse_heading_reports_only_the_heading_style():
+    """Font, size, colour and bold all repeat the h1 QuickStyleDef (colour in
+    another case), so the heading reads back without per-paragraph formatting."""
+    items = _items(
+        '<one:OE quickStyleIndex="1" style="font-family:Calibri;font-size:16.0pt;color:#1e4e79">'
+        "<one:T><![CDATA[<span style='font-weight:bold'>Head</span>]]></one:T></one:OE>",
+        defs=_P_QSD + _H1_QSD,
+    )
+    assert items == [{"type": "paragraph", "text": "Head", "style": "h1"}]
+
+
+def test_parse_paragraph_keeps_formatting_of_a_quick_style_a_rewrite_drops():
+    """Only 'p' and heading styles come back on a rewrite, so the formatting
+    another quick style supplies is reported to keep the paragraph's look."""
+    qsd = '<one:QuickStyleDef index="2" name="code" font="Consolas" fontSize="10.0"/>'
+    items = _items(
+        '<one:OE quickStyleIndex="2" style="font-family:Consolas;font-size:10.0pt"><one:T>x = 1</one:T></one:OE>',
+        defs=qsd,
+    )
+    assert items == [{"type": "paragraph", "text": "x = 1", "font_family": "Consolas", "font_size": 10.0}]
+
+
+def test_parse_list_item_reads_oe_style_as_segments():
+    items = _items(f'<one:OE style="font-size:14.0pt">{_BULLET}<one:T>big item</one:T></one:OE>')
+    assert items == [{"type": "list", "style": "bullet", "items": [
+        {"segments": [{"text": "big item", "font_size": 14.0}]},
+    ]}]
+
+
+def test_parse_list_item_style_repeating_p_quick_style_reads_as_text():
+    items = _items(
+        f'<one:OE quickStyleIndex="0" style="font-family:Calibri;font-size:11.0pt">{_BULLET}<one:T>item</one:T></one:OE>',
+        defs=_P_QSD,
+    )
+    assert items == [{"type": "list", "style": "bullet", "items": [{"text": "item"}]}]
+
+
+def test_parse_list_item_keeps_heading_quick_style_formatting():
+    """A list item has no heading style, so the bold of a bulleted heading is
+    reported instead of dropped."""
+    items = _items(
+        f"<one:OE quickStyleIndex=\"1\">{_BULLET}<one:T><![CDATA[<span style='font-weight:bold'>item</span>]]></one:T></one:OE>",
+        defs=_H1_QSD,
+    )
+    assert items == [{"type": "list", "style": "bullet", "items": [{"segments": [{"text": "item", "bold": True}]}]}]
+
+
+def test_roundtrip_oe_style_formatting_is_stable():
+    page = parse_page(_outline_xml(
+        '<one:OE style="color:#C00000;font-family:Courier New">'
+        "<one:T><![CDATA[<span style='font-weight:bold'>x</span> y]]></one:T></one:OE>",
+        f'<one:OE style="font-size:14.0pt">{_BULLET}<one:T>item</one:T></one:OE>',
+    ))
+    assert _reread(page).model_dump(exclude_defaults=True) == page.model_dump(exclude_defaults=True)
+
+
+# ---------------------------------------------------------------------------
+# Indented content: <one:OEChildren> under paragraphs, images and list items
+# ---------------------------------------------------------------------------
+
+def test_parse_paragraph_children():
+    items = _items(
+        "<one:OE><one:T>parent</one:T><one:OEChildren>"
+        "<one:OE><one:T>child</one:T><one:OEChildren><one:OE><one:T>grandchild</one:T></one:OE></one:OEChildren></one:OE>"
+        f"<one:OE>{_BULLET}<one:T>a</one:T></one:OE>"
+        f"<one:OE>{_BULLET}<one:T>b</one:T></one:OE>"
+        "</one:OEChildren></one:OE>"
+    )
+    assert items == [{"type": "paragraph", "text": "parent", "children": [
+        {"type": "paragraph", "text": "child", "children": [{"type": "paragraph", "text": "grandchild"}]},
+        {"type": "list", "style": "bullet", "items": [{"text": "a"}, {"text": "b"}]},
+    ]}]
+
+
+def test_parse_oe_without_content_keeps_its_children():
+    items = _items("<one:OE><one:OEChildren><one:OE><one:T>child</one:T></one:OE></one:OEChildren></one:OE>")
+    assert items == [{"type": "paragraph", "text": "", "children": [{"type": "paragraph", "text": "child"}]}]
+
+
+def test_parse_inline_image_children():
+    items = _items(
+        "<one:OE><one:Image><one:Data>mcpref:abc123def456</one:Data></one:Image>"
+        "<one:OEChildren><one:OE><one:T>caption</one:T></one:OE></one:OEChildren></one:OE>"
+    )
+    assert items == [{"type": "inline_image", "handle": "mcpref:abc123def456", "children": [
+        {"type": "paragraph", "text": "caption"},
+    ]}]
+
+
+def test_parse_page_reads_every_oechildren_of_an_outline():
+    xml = _page_xml(
+        "<one:Outline>"
+        "<one:OEChildren><one:OE><one:T>first</one:T></one:OE></one:OEChildren>"
+        "<one:OEChildren><one:OE><one:T>second</one:T></one:OE></one:OEChildren>"
+        "</one:Outline>"
+    )
+    assert [item.text for item in parse_page(xml).outlines[0].items] == ["first", "second"]
+
+
+def test_parse_list_item_keeps_non_list_children_in_order():
+    items = _items(
+        f"<one:OE>{_BULLET}<one:T>step</one:T><one:OEChildren>"
+        f"<one:OE>{_BULLET}<one:T>sub</one:T></one:OE>"
+        "<one:OE><one:Image><one:Data>mcpref:abc123def456</one:Data></one:Image></one:OE>"
+        "<one:OE><one:T>note</one:T></one:OE>"
+        "</one:OEChildren></one:OE>"
+    )
+    assert items == [{"type": "list", "style": "bullet", "items": [{"text": "step", "children": [
+        {"text": "sub"},
+        {"type": "inline_image", "handle": "mcpref:abc123def456"},
+        {"type": "paragraph", "text": "note"},
+    ]}]}]
+
+
+def test_parse_bulleted_image_is_read_as_image_between_lists():
+    items = _items(
+        f"<one:OE>{_BULLET}<one:T>a</one:T></one:OE>",
+        f"<one:OE>{_BULLET}<one:Image><one:Data>mcpref:abc123def456</one:Data></one:Image></one:OE>",
+        f"<one:OE>{_BULLET}<one:T>b</one:T></one:OE>",
+    )
+    assert items == [
+        {"type": "list", "style": "bullet", "items": [{"text": "a"}]},
+        {"type": "inline_image", "handle": "mcpref:abc123def456"},
+        {"type": "list", "style": "bullet", "items": [{"text": "b"}]},
+    ]
+
+
+def test_build_page_xml_nests_paragraph_children_after_the_text():
+    outline = Outline(items=[
+        Paragraph(type="paragraph", text="parent", children=[Paragraph(type="paragraph", text="child")]),
+        Paragraph(type="paragraph", text="leaf"),
+    ])
+    root = _parse_xml(build_page_xml("Title", [outline]))
+    parent_oe, leaf_oe = root.findall("one:Outline/one:OEChildren/one:OE", _NS)
+    assert [el.tag for el in parent_oe] == [f"{{{_ONE_NS_URI}}}T", f"{{{_ONE_NS_URI}}}OEChildren"]
+    assert parent_oe.find("one:OEChildren/one:OE/one:T", _NS).text == "child"
+    assert leaf_oe.find("one:OEChildren", _NS) is None
+
+
+def test_build_page_xml_nests_inline_image_children():
+    image = InlineImage(type="inline_image", handle="mcpref:abc123def456",
+                        children=[Paragraph(type="paragraph", text="caption")])
+    root = _parse_xml(build_page_xml("Title", [Outline(items=[image])]))
+    oe = root.find("one:Outline/one:OEChildren/one:OE", _NS)
+    assert [el.tag for el in oe] == [f"{{{_ONE_NS_URI}}}Image", f"{{{_ONE_NS_URI}}}OEChildren"]
+    assert oe.find("one:OEChildren/one:OE/one:T", _NS).text == "caption"
+
+
+def test_build_page_xml_writes_non_list_children_of_list_items():
+    lst = List(type="list", style="numbered", items=[ListItem(text="step", children=[
+        ListItem(text="sub"), Paragraph(type="paragraph", text="note"),
+    ])])
+    root = _parse_xml(build_page_xml("Title", [Outline(items=[lst])]))
+    child_oes = root.findall("one:Outline/one:OEChildren/one:OE/one:OEChildren/one:OE", _NS)
+    assert [oe.find("one:T", _NS).text for oe in child_oes] == ["sub", "note"]
+    assert [oe.find("one:List/one:Number", _NS) is not None for oe in child_oes] == [True, False]
+
+
+def test_build_page_xml_omits_oechildren_when_all_sub_items_are_empty():
+    lst = List(type="list", style="bullet", items=[ListItem(text="item", children=[ListItem()])])
+    root = _parse_xml(build_page_xml("Title", [Outline(items=[lst])]))
+    assert root.find("one:Outline/one:OEChildren/one:OE/one:OEChildren", _NS) is None
+
+
+def test_roundtrip_nested_content_is_stable():
+    page = parse_page(_outline_xml(
+        "<one:OE><one:T>parent</one:T><one:OEChildren>"
+        "<one:OE><one:T>child</one:T></one:OE>"
+        f"<one:OE>{_BULLET}<one:T>bullet</one:T><one:OEChildren>"
+        f"<one:OE>{_BULLET}<one:T>sub</one:T></one:OE>"
+        "<one:OE><one:T>note under the bullet</one:T></one:OE>"
+        "</one:OEChildren></one:OE>"
+        "</one:OEChildren></one:OE>",
+        "<one:OE><one:Image><one:Data>mcpref:abc123def456</one:Data></one:Image>"
+        "<one:OEChildren><one:OE><one:T>caption</one:T></one:OE></one:OEChildren></one:OE>",
+    ))
+    first = page.model_dump(exclude_defaults=True)
+    assert first["outlines"][0]["items"][0]["children"][1]["items"][0]["children"][1] == {
+        "type": "paragraph", "text": "note under the bullet",
+    }
+    reread = _reread(page)
+    assert reread.model_dump(exclude_defaults=True) == first
+    assert _reread(reread).model_dump(exclude_defaults=True) == first
+
+
+# ---------------------------------------------------------------------------
+# Content the slim model cannot represent: read-only "unsupported" markers
+# ---------------------------------------------------------------------------
+
+def _cell(*texts: str) -> str:
+    oes = "".join(f"<one:OE><one:T>{text}</one:T></one:OE>" for text in texts)
+    return f"<one:Cell><one:OEChildren>{oes}</one:OEChildren></one:Cell>"
+
+
+_BOLD_ADA = "<![CDATA[<span style='font-weight:bold'>Ada</span>]]>"
+_TABLE = (
+    '<one:Table bordersVisible="true"><one:Columns>'
+    '<one:Column index="0" width="80.0"/><one:Column index="1" width="80.0"/>'
+    "</one:Columns>"
+    f"<one:Row>{_cell('Name')}{_cell('Age')}</one:Row>"
+    f"<one:Row>{_cell(_BOLD_ADA, 'Lovelace')}{_cell('36')}</one:Row>"
+    "</one:Table>"
+)
+
+
+def test_parse_table_becomes_unsupported_item_with_cell_text():
+    assert _items(f"<one:OE>{_TABLE}</one:OE>") == [
+        {"type": "unsupported", "kind": "table", "text": "Name | Age\nAda Lovelace | 36"},
+    ]
+
+
+def test_parse_ink_paragraph_reports_recognized_text():
+    items = _items(
+        "<one:OE><one:InkParagraph>"
+        '<one:InkWord recognizedText="hello"><one:CallbackID callbackID="{1}"/></one:InkWord>'
+        '<one:InkWord recognizedText="world"><one:CallbackID callbackID="{2}"/></one:InkWord>'
+        "</one:InkParagraph></one:OE>"
+    )
+    assert items == [{"type": "unsupported", "kind": "ink", "text": "hello world"}]
+
+
+def test_parse_text_mixed_with_ink_words_keeps_both_in_order():
+    items = _items(
+        "<one:OE><one:T>Meet</one:T>"
+        '<one:InkWord recognizedText="Bob"><one:CallbackID callbackID="{1}"/></one:InkWord>'
+        "<one:T><![CDATA[<span style='font-weight:bold'>today</span>]]></one:T>"
+        '<one:InkWord><one:CallbackID callbackID="{2}"/></one:InkWord>'
+        "</one:OE>"
+    )
+    assert items == [{"type": "unsupported", "kind": "ink", "text": "Meet Bob today"}]
+
+
+@pytest.mark.parametrize("content, expected", [
+    ('<one:InkDrawing><one:CallbackID callbackID="{1}"/></one:InkDrawing>',
+     {"type": "unsupported", "kind": "ink"}),
+    ('<one:InsertedFile pathCache="C:\\cache\\x.bin" preferredName="report.pdf"/>',
+     {"type": "unsupported", "kind": "file", "text": "report.pdf"}),
+    ('<one:MediaFile pathCache="C:\\cache\\y.bin" preferredName="Recording.wma"/>',
+     {"type": "unsupported", "kind": "media", "text": "Recording.wma"}),
+    ("<one:FutureObject/>", {"type": "unsupported", "kind": "unknown"}),
+], ids=["ink-drawing", "inserted-file", "media-file", "future-object"])
+def test_parse_other_oe_content_becomes_unsupported_item(content, expected):
+    assert _items(f"<one:OE>{content}</one:OE>") == [expected]
+
+
+def test_parse_unsupported_item_keeps_its_children():
+    items = _items(
+        f"<one:OE>{_TABLE}<one:OEChildren><one:OE><one:T>below the table</one:T></one:OE></one:OEChildren></one:OE>"
+    )
+    assert items[0]["children"] == [{"type": "paragraph", "text": "below the table"}]
+
+
+def test_parse_bulleted_table_is_read_as_unsupported_item_between_lists():
+    items = _items(
+        f"<one:OE>{_BULLET}<one:T>a</one:T></one:OE>",
+        f"<one:OE>{_BULLET}{_TABLE}</one:OE>",
+        f"<one:OE>{_BULLET}<one:T>b</one:T></one:OE>",
+    )
+    assert [item["type"] for item in items] == ["list", "unsupported", "list"]
+    assert items[1]["kind"] == "table"
+
+
+def test_parse_unsupported_content_nested_under_list_item():
+    items = _items(
+        f"<one:OE>{_BULLET}<one:T>step</one:T><one:OEChildren><one:OE>{_TABLE}</one:OE></one:OEChildren></one:OE>"
+    )
+    assert items[0]["items"][0]["children"] == [
+        {"type": "unsupported", "kind": "table", "text": "Name | Age\nAda Lovelace | 36"},
+    ]
+
+
+def test_parse_page_reports_page_level_ink_drawing():
+    xml = _page_xml(
+        "<one:InkDrawing>"
+        '<one:Position x="100.0" y="200.0" z="4"/><one:Size width="50.0" height="25.0"/>'
+        '<one:CallbackID callbackID="{1}"/>'
+        "</one:InkDrawing>"
+    )
+    page = parse_page(xml)
+    assert page.outlines == []
+    assert page.model_dump(exclude_defaults=True)["unsupported"] == [
+        {"kind": "ink", "position": {"x": 100.0, "y": 200.0, "z": 4}, "width": 50.0, "height": 25.0},
+    ]
+
+
+def test_parse_page_reports_page_level_inserted_file_by_name():
+    xml = _page_xml('<one:InsertedFile pathCache="C:\\cache\\x.bin" preferredName="slides.pptx"/>')
+    assert parse_page(xml).model_dump(exclude_defaults=True)["unsupported"] == [
+        {"kind": "file", "text": "slides.pptx"},
+    ]
+
+
+def test_parse_page_without_unsupported_objects_omits_the_list():
+    xml = _page_xml("<one:Outline><one:OEChildren><one:OE><one:T>x</one:T></one:OE></one:OEChildren></one:Outline>")
+    assert "unsupported" not in parse_page(xml).model_dump(exclude_defaults=True)
+
+
+_TABLE_ITEM = UnsupportedItem(type="unsupported", kind="table", text="a | b")
+
+
+@pytest.mark.parametrize("outline", [
+    Outline(items=[Paragraph(type="paragraph", text="kept"), _TABLE_ITEM]),
+    Outline(items=[Paragraph(type="paragraph", text="p", children=[_TABLE_ITEM])]),
+    Outline(items=[List(type="list", style="bullet", items=[ListItem(text="i", children=[_TABLE_ITEM])])]),
+    Outline(items=[InlineImage(type="inline_image", handle="mcpref:abc123def456", children=[_TABLE_ITEM])]),
+], ids=["outline", "paragraph-child", "list-item-child", "image-child"])
+def test_build_page_xml_rejects_unsupported_items(outline):
+    with pytest.raises(ValueError, match=r"'unsupported' \(kind 'table'\).*delete that content.*remove the item"):
+        build_page_xml("Title", [outline])
+
+
+def test_build_append_xml_rejects_unsupported_items():
+    with pytest.raises(ValueError, match=r"'unsupported' \(kind 'ink'\)"):
+        build_append_xml(Outline(items=[UnsupportedItem(type="unsupported", kind="ink")]))
+
+
+def test_read_page_with_table_cannot_be_written_back_unchanged():
+    page = parse_page(_outline_xml("<one:OE><one:T>intro</one:T></one:OE>", f"<one:OE>{_TABLE}</one:OE>"))
+    with pytest.raises(ValueError, match="kind 'table'"):
+        build_page_xml(page.title, page.outlines, page.images)
+
+
+# ---------------------------------------------------------------------------
+# Screenshot placeholders: a marked label OE, plus a box OE reserving the space
+# ---------------------------------------------------------------------------
+
+_LABEL_META = '<one:Meta name="onenote-mcp.image-placeholder" content="label"/>'
+_BOX_META = '<one:Meta name="onenote-mcp.image-placeholder" content="box"/>'
+
+
+def _label_oe(text: str) -> str:
+    return f"<one:OE>{_LABEL_META}<one:T>{text}</one:T></one:OE>"
+
+
+def _box_oe(alt: str = "Image placeholder", width: float = 300.0, height: float = 150.0) -> str:
+    return (
+        f'<one:OE>{_BOX_META}<one:Image alt="{alt}"><one:Size width="{width}" height="{height}" isSetByUser="true"/>'
+        "<one:Data>mcpref:abc123def456</one:Data></one:Image></one:OE>"
+    )
+
+
+def _png_rows(png: bytes, width: int) -> list[bytes]:
+    """Return the pixel rows of an RGB PNG written by _box_png (one IDAT chunk)."""
+    length = int.from_bytes(png[33:37], "big")
+    raw = zlib.decompress(png[41:41 + length])
+    stride = 1 + 3 * width
+    return [raw[start + 1:start + stride] for start in range(0, len(raw), stride)]
+
+
+def _placeholder_oes(ph: ImagePlaceholder) -> list[ET.Element]:
+    root = _parse_xml(build_page_xml("Doc", [Outline(items=[ph])]))
+    return root.findall("one:Outline/one:OEChildren/one:OE", _NS)
+
+
+def test_build_placeholder_marks_its_label_and_reserves_a_box_of_exactly_its_size():
+    label, box = _placeholder_oes(
+        ImagePlaceholder(type="image_placeholder", description="Screenshot des Dialogs", width=600.0, height=270.0)
+    )
+    assert label.find("one:Meta", _NS).attrib == {"name": "onenote-mcp.image-placeholder", "content": "label"}
+    assert label.find("one:T", _NS).text == (
+        '<span style="font-weight:bold;background:#FFEB3B">Screenshot des Dialogs</span>'
+    )
+    assert box.find("one:Meta", _NS).attrib == {"name": "onenote-mcp.image-placeholder", "content": "box"}
+    image = box.find("one:Image", _NS)
+    assert image.get("alt") == "Image placeholder"
+    assert image.find("one:Size", _NS).attrib == {"width": "600.0", "height": "270.0", "isSetByUser": "true"}
+    assert pixel_size(base64.b64decode(image.find("one:Data", _NS).text)) == (600, 270)
+
+
+def test_build_placeholder_without_size_writes_the_label_only():
+    (label,) = _placeholder_oes(ImagePlaceholder(type="image_placeholder", description="Diagramm"))
+    assert label.find("one:Meta", _NS).get("content") == "label"
+    assert label.find("one:Image", _NS) is None
+
+
+def test_box_png_is_a_light_fill_inside_a_border():
+    png = _box_png(10, 6)
+    assert pixel_size(png) == (10, 6)
+    rows = _png_rows(png, 10)
+    border, fill = bytes((0xB0, 0x75, 0x00)), bytes((0xFF, 0xF9, 0xC4))
+    assert len(rows) == 6
+    assert rows[0] == border * 10
+    assert rows[3] == border * 2 + fill * 6 + border * 2
+
+
+@pytest.mark.parametrize("size, pixels", [
+    ((600.0, 400.0), (600, 400)),
+    ((2000.0, 500.0), (1000, 250)),
+    ((300.0, 4000.0), (75, 1000)),
+    ((0.2, 0.1), (1, 1)),
+])
+def test_box_pixel_size_keeps_the_aspect_and_caps_the_longer_side(size, pixels):
+    assert _box_pixel_size(*size) == pixels
+
+
+def test_parse_placeholder_label_and_box_read_back_as_one_item():
+    assert _items(_label_oe("Screenshot here"), _box_oe(width=300.0, height=150.0)) == [
+        {"type": "image_placeholder", "description": "Screenshot here", "width": 300.0, "height": 150.0},
+    ]
+
+
+@pytest.mark.parametrize("ph", [
+    ImagePlaceholder(type="image_placeholder", description="Bildschirmfoto: Anmeldung", width=480.0, height=320.0),
+    ImagePlaceholder(type="image_placeholder", description="label only"),
+], ids=["with-box", "label-only"])
+def test_placeholder_read_write_read_is_stable(ph):
+    first = parse_page(build_page_xml("Doc", [Outline(items=[ph])]))
+    assert first.outlines[0].items == [ph]
+    assert _reread(first).outlines[0].items == [ph]
+
+
+def test_parse_placeholder_is_recognized_by_its_meta_not_its_text():
+    assert _items(
+        _label_oe("anything at all"),
+        "<one:OE><one:T>[INSERT IMAGE: an old-style callout]</one:T></one:OE>",
+    ) == [
+        {"type": "image_placeholder", "description": "anything at all"},
+        {"type": "paragraph", "text": "[INSERT IMAGE: an old-style callout]"},
+    ]
+
+
+def test_parse_image_put_into_the_box_paragraph_is_not_the_placeholder():
+    assert _items(_label_oe("Screenshot here"), _box_oe(alt="a pasted screenshot")) == [
+        {"type": "image_placeholder", "description": "Screenshot here"},
+        {"type": "inline_image", "handle": "mcpref:abc123def456", "width": 300.0, "height": 150.0},
+    ]
+
+
+def test_parse_box_without_its_label_reads_as_an_inline_image():
+    assert _items(_box_oe()) == [
+        {"type": "inline_image", "handle": "mcpref:abc123def456", "width": 300.0, "height": 150.0},
+    ]
+
+
+def test_parse_placeholder_label_with_indented_content_reads_as_a_paragraph():
+    label = (
+        f"<one:OE>{_LABEL_META}<one:T>Screenshot here</one:T>"
+        "<one:OEChildren><one:OE><one:T>a note</one:T></one:OE></one:OEChildren></one:OE>"
+    )
+    assert [item["type"] for item in _items(label, _box_oe())] == ["paragraph", "inline_image"]
+
+
+def test_placeholders_nested_under_paragraphs_and_list_items_round_trip():
+    ph = ImagePlaceholder(type="image_placeholder", description="nested", width=200.0, height=100.0)
+    outline = Outline(items=[
+        Paragraph(type="paragraph", text="parent", children=[ph]),
+        List(type="list", style="numbered", items=[ListItem(text="step", children=[ph])]),
+    ])
+    items = parse_page(build_page_xml("Doc", [outline])).outlines[0].items
+    assert items[0].children == [ph]
+    assert items[1].items[0].children == [ph]

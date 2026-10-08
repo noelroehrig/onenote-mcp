@@ -20,8 +20,9 @@ get_page reads pages WITHOUT binary image bytes by default (pageInfo=0).  In
 that mode OneNote returns each image as a <one:CallbackID> reference.  We mint a
 stable ``mcpref:`` handle for each and remember its (page_id, callbackID) source
 so the bytes can be fetched lazily via GetBinaryPageContent only when a handle is
-actually written back.  This keeps reads of image-heavy pages small and fast and
-avoids shipping megabytes of base64 to the model on every read.  Resolved bytes
+actually written back, validated or fetched with get_image_data.  This keeps
+reads of image-heavy pages small and fast and avoids shipping megabytes of
+base64 to the model on every read.  Resolved bytes
 are kept in an LRU cache capped at ONENOTE_IMAGE_CACHE_MB (default 200 MB).
 
 Access restriction
@@ -165,6 +166,9 @@ class OneNoteError(Exception):
       backend_error  OneNote returned a COM failure (bad id, locked content, …).
       bad_request    The request itself was malformed (e.g. unknown handle).
       config_error   The server's environment configuration is invalid.
+      partial_write  A replace wrote the new content, but old page objects it
+                     could not delete are still on the page (listed in the
+                     message).
     """
 
     def __init__(self, message: str, code: str = "backend_error") -> None:
@@ -416,17 +420,9 @@ def _image_pixel_size(data_el: ET.Element | None) -> tuple[int, int] | None:
         return None
 
 
-def validate_handles(handles: list[str]) -> dict[str, bool]:
-    """Return {handle: resolvable} for each handle without fetching bytes.
-
-    A handle is resolvable if its bytes are cached or its (page, callback)
-    source is known.  Pure validation — no COM call — so it is safe and fast.
-    """
-    result: dict[str, bool] = {}
-    for h in handles:
-        key = h[len(_MCPREF_PREFIX):] if h.startswith(_MCPREF_PREFIX) else h
-        result[h] = key in _IMAGE_CACHE or key in _HANDLE_SOURCES
-    return result
+def _handle_key(handle: str) -> str:
+    """Return the cache key of *handle*: the handle without its 'mcpref:' prefix."""
+    return handle[len(_MCPREF_PREFIX):] if handle.startswith(_MCPREF_PREFIX) else handle
 
 
 # ---- Request guards -----------------------------------------------------------
@@ -574,11 +570,83 @@ def _get_page_impl(page_id: str, include_binary: bool = False) -> str:
 
 def _get_image_data_impl(handle: str) -> str:
     app = _app()
-    key = handle[len(_MCPREF_PREFIX):] if handle.startswith(_MCPREF_PREFIX) else handle
-    return _resolve_handle_bytes(key, app)
+    return _resolve_handle_bytes(_handle_key(handle), app)
 
 
-def _replace_page_impl(page_id: str, page_xml: str) -> None:
+# OneNote hresults saying an image's bytes are gone along with the image or its
+# page (Microsoft's "Error codes (OneNote)" list).
+_IMAGE_GONE_HRESULTS = frozenset({
+    0x80042005,  # hrPageDoesNotExist
+    0x8004200E,  # hrPageObjectDoesNotExist
+    0x8004200F,  # hrBinaryObjectDoesNotExist
+    0x80042014,  # hrObjectDoesNotExist
+})
+
+
+def _fetch_handles_impl(keys: list[str]) -> dict[str, bool]:
+    """Fetch and cache the bytes of each source-only handle key.
+
+    Maps each key to True when OneNote returned the bytes, False when it
+    reports the image or its page gone.  Any other COM failure propagates.
+    """
+    app = _app()
+    fetched: dict[str, bool] = {}
+    for key in keys:
+        try:
+            _resolve_handle_bytes(key, app)
+        except comtypes.COMError as exc:
+            if (exc.hresult & 0xFFFFFFFF) not in _IMAGE_GONE_HRESULTS:
+                raise
+            fetched[key] = False
+        else:
+            fetched[key] = True
+    return fetched
+
+
+_TITLE_TAG = f"{{{_ONE_NS}}}Title"
+
+
+def _objects_to_delete(page_root: ET.Element, keep_tags: frozenset[str]) -> list[ET.Element]:
+    """Return the top-level objects of *page_root* a replace deletes: every one
+    with an objectID except the title (updated in place) and those whose tag is
+    in *keep_tags*."""
+    return [
+        child for child in page_root
+        if child.get("objectID") and child.tag != _TITLE_TAG and child.tag not in keep_tags
+    ]
+
+
+def _delete_page_objects(app, page_id: str, objects: list[ET.Element]) -> list[str]:
+    """Delete each of *objects* from the page and describe every deletion that
+    failed, e.g. "Outline {…}{12}{B0} (hresult=-0x7ffbdff2)".
+
+    A failure does not stop the remaining deletions.
+    """
+    failures: list[str] = []
+    for obj in objects:
+        object_id = obj.get("objectID")
+        try:
+            # Third arg dateExpectedLastModified must be a float (OLE date);
+            # 0.0 means no conflict check.
+            app.DeletePageContent(page_id, object_id, 0.0)
+        except comtypes.COMError as exc:
+            kind = obj.tag.rsplit("}", 1)[-1]
+            failures.append(f"{kind} {object_id} (hresult={exc.hresult:#010x})")
+    return failures
+
+
+def _partial_write_error(failures: list[str]) -> OneNoteError:
+    """Return the error for a replace whose write succeeded although *failures*
+    (old objects) could not be deleted."""
+    return OneNoteError(
+        f"The new content was written, but {len(failures)} old page object(s) could "
+        f"not be deleted and are still on the page: {'; '.join(failures)}. Read the "
+        "page with get_page and decide how to handle them instead of retrying the replace.",
+        code="partial_write",
+    )
+
+
+def _replace_page_impl(page_id: str, page_xml: str, keep_tags: frozenset[str]) -> None:
     """Full-replace implementation — runs on the worker thread.
 
     See replace_page docstring for full semantics.
@@ -586,7 +654,6 @@ def _replace_page_impl(page_id: str, page_xml: str) -> None:
     app = _app()
     _ensure_allowed(app, page_id, "Page")
 
-    _TITLE_TAG = f"{{{_ONE_NS}}}Title"
     current_xml = app.GetPageContent(page_id, 0)
     current_root = ET.fromstring(current_xml)
 
@@ -613,25 +680,16 @@ def _replace_page_impl(page_id: str, page_xml: str) -> None:
     # GetBinaryPageContent, which would fail if we deleted the image first.
     serialized = _complete_image_sizes(_resolve_mcpref_to_data(serialized, app))
 
-    # --- delete-pass: remove all existing top-level children via DeletePageContent ---
-    for child in current_root:
-        object_id = child.get("objectID")
-        if not object_id:
-            continue
-        if child.tag == _TITLE_TAG:
-            # Title is preserved and updated in-place in the write-pass.
-            continue
-        # Best-effort: some objects may not be deletable (e.g. locked content).
-        try:
-            # Third arg dateExpectedLastModified must be a float (OLE date);
-            # 0.0 means no conflict check.
-            app.DeletePageContent(page_id, object_id, 0.0)
-        except comtypes.COMError:
-            pass
+    # --- delete-pass: remove the existing top-level objects via DeletePageContent ---
+    failures = _delete_page_objects(app, page_id, _objects_to_delete(current_root, keep_tags))
 
     # --- write-pass: insert the new content ---
+    # Written even after failed deletions: stopping here would leave a page
+    # with part of its old content and none of the new.
     # Pass 0.0 for dateExpectedLastModified (OLE date epoch = no conflict check)
     app.UpdatePageContent(serialized, 0.0)
+    if failures:
+        raise _partial_write_error(failures)
 
 
 def _plan_subpage_order(
@@ -820,6 +878,25 @@ def get_image_data(handle: str) -> str:
         ) from exc
 
 
+def validate_handles(handles: list[str]) -> dict[str, bool]:
+    """Return {handle: writable} for each handle.
+
+    A handle is writable when its bytes are in hand.  Cached handles are; for a
+    handle known only by its (page, callback) source the bytes are fetched from
+    OneNote now and cached, and it is writable when OneNote returns them.
+    Unknown handles are not.  Raises OneNoteError(code="timeout") when OneNote
+    does not answer: a wedged OneNote says nothing about the handles.
+    """
+    keys = {handle: _handle_key(handle) for handle in handles}
+    cached = {key for key in keys.values() if _cache_get(key) is not None}
+    to_fetch = [key for key in dict.fromkeys(keys.values()) if key not in cached and key in _HANDLE_SOURCES]
+    try:
+        fetched = _run_com(_fetch_handles_impl, to_fetch, timeout=READ_TIMEOUT) if to_fetch else {}
+    except comtypes.COMError as exc:
+        raise OneNoteError(f"validate_handles failed: hresult={exc.hresult:#010x}") from exc
+    return {handle: key in cached or fetched.get(key, False) for handle, key in keys.items()}
+
+
 def create_page(
     section_id: str,
     title: str | None = None,
@@ -841,7 +918,7 @@ def create_page(
         ) from exc
 
 
-def replace_page(page_id: str, page_xml: str) -> None:
+def replace_page(page_id: str, page_xml: str, keep_tags: frozenset[str] = frozenset()) -> None:
     """Full-replace the page identified by *page_id* with *page_xml*.
 
     The caller supplies a complete <one:Page> document. The root element's ID
@@ -854,14 +931,16 @@ def replace_page(page_id: str, page_xml: str) -> None:
     Implementation note: OneNote UpdatePageContent is an upsert keyed on
     objectID.  To achieve a true replace, this function first issues a
     delete-pass that calls DeletePageContent for every top-level child of the
-    current page (except <one:Title>), then writes the new content.
+    current page (except <one:Title> and the elements whose tag is in
+    *keep_tags*, which stay where they are), then writes the new content.
     DeletePageContent handles all object types including images and ink — no
-    special-casing is required.  Each deletion is wrapped in a try/except so
-    a single un-deletable object cannot abort the whole replace.
+    special-casing is required.  Every deletion is attempted and the new
+    content is written even if some fail; OneNoteError(code="partial_write")
+    then lists the objects that are still on the page.
     """
     _parse_user_xml(page_xml, "page")
     try:
-        _run_com(_replace_page_impl, page_id, page_xml, timeout=WRITE_TIMEOUT)
+        _run_com(_replace_page_impl, page_id, page_xml, keep_tags, timeout=WRITE_TIMEOUT)
     except comtypes.COMError as exc:
         raise OneNoteError(
             f"replace_page failed (page {page_id!r}): hresult={exc.hresult:#010x}"
