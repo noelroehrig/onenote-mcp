@@ -513,7 +513,7 @@ def test_replace_page_with_width_only_outlines(mcp_session, claudespike_section_
             "position": {"x": 36.0, "y": 70.0, "z": 0},
             "width": 700.0,
             "items": [
-                {"type": "paragraph", "text": "STARTERAUFGABE", "style": "h1",
+                {"type": "paragraph", "text": "WARM-UP", "style": "h1",
                  "bold": True, "color": "#ffffff", "font_size": 22, "highlight": "#2e7d32"},
                 {"type": "paragraph", "text": "Body paragraph", "bold": True},
             ],
@@ -522,7 +522,7 @@ def test_replace_page_with_width_only_outlines(mcp_session, claudespike_section_
             "position": {"x": 36.0, "y": 470.0, "z": 1},
             "width": 700.0,
             "items": [
-                {"type": "paragraph", "text": "TAGESPLAN", "style": "h1"},
+                {"type": "paragraph", "text": "AGENDA", "style": "h1"},
                 {"type": "list", "style": "bullet", "items": [
                     {"text": "First bullet"},
                     {"text": "Second bullet"},
@@ -533,7 +533,7 @@ def test_replace_page_with_width_only_outlines(mcp_session, claudespike_section_
             "position": {"x": 36.0, "y": 660.0, "z": 2},
             "width": 700.0,
             "items": [
-                {"type": "paragraph", "text": "EINSTIEG", "style": "h1"},
+                {"type": "paragraph", "text": "INTRODUCTION", "style": "h1"},
                 {"type": "image_placeholder", "description": "Diagram here",
                  "width": 600.0, "height": 270.0},
             ],
@@ -542,7 +542,7 @@ def test_replace_page_with_width_only_outlines(mcp_session, claudespike_section_
             "position": {"x": 800.0, "y": 70.0, "z": 3},
             "width": 470.0,
             "items": [
-                {"type": "paragraph", "text": "LOESUNGEN", "style": "h2"},
+                {"type": "paragraph", "text": "SOLUTIONS", "style": "h2"},
                 {"type": "paragraph", "text": "Detail row", "font_size": 10},
             ],
         },
@@ -564,7 +564,7 @@ def test_replace_page_with_width_only_outlines(mcp_session, claudespike_section_
         for item in outline.get("items", []):
             if item.get("text"):
                 all_texts.append(item["text"])
-    for needle in ("STARTERAUFGABE", "TAGESPLAN", "EINSTIEG", "LOESUNGEN"):
+    for needle in ("WARM-UP", "AGENDA", "INTRODUCTION", "SOLUTIONS"):
         assert any(needle in t for t in all_texts), (
             f"Expected {needle!r} in page after width-only-outline write, got: {all_texts}"
         )
@@ -587,7 +587,7 @@ def test_replace_page_drops_empty_list_item(mcp_session, claudespike_section_id)
             "position": {"x": 36.0, "y": 70.0, "z": 0},
             "width": 700.0,
             "items": [
-                {"type": "paragraph", "text": "Aufgabe 4: Monsterzahlen", "bold": True},
+                {"type": "paragraph", "text": "Task 4: Example list", "bold": True},
                 {"type": "list", "style": "numbered", "items": [
                     {"text": "Real entry"},
                     {},  # empty item Claude sometimes emits — must not blow up

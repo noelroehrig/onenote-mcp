@@ -429,7 +429,7 @@ def test_parse_notebook_skeleton_empty():
 def test_parse_section_pages_returns_id_and_name():
     xml = (
         '<one:Section xmlns:one="http://schemas.microsoft.com/office/onenote/2013/onenote"'
-        ' ID="sec1" name="Vorlagen">'
+        ' ID="sec1" name="Templates">'
         '<one:Page ID="p1" name="Template A"/>'
         '<one:Page ID="p2" name="Template B"/>'
         '</one:Section>'
@@ -1175,7 +1175,7 @@ _SPECIAL_TEXTS = [
     "<b>not bold</b>",
     "ends a CDATA section ]]> early",
     "\"double\" and 'single' quotes",
-    "Grüße aus Köln: äöü ÄÖÜ ß",
+    "Grüße: äöü ÄÖÜ ß",
 ]
 
 

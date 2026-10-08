@@ -13,6 +13,7 @@ try:
         OneNoteError,
         _allowed_notebooks,
         _ensure_allowed,
+        allowlist_config_error,
         _filter_notebooks_xml,
         _parse_user_xml,
     )
@@ -69,14 +70,41 @@ def test_allowed_notebooks_unset_means_unrestricted(monkeypatch):
     assert _allowed_notebooks() is None
 
 
-def test_allowed_notebooks_blank_means_unrestricted(monkeypatch):
-    monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", "   ")
-    assert _allowed_notebooks() is None
+@pytest.mark.parametrize("value", ["", "   ", " , ,"])
+def test_allowed_notebooks_empty_allows_nothing(monkeypatch, value):
+    monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", value)
+    assert _allowed_notebooks() == set()
 
 
 def test_allowed_notebooks_parses_and_strips_names(monkeypatch):
-    monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", " ClaudeSpike , Mathe 5a,,")
-    assert _allowed_notebooks() == {"ClaudeSpike", "Mathe 5a"}
+    monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", " ClaudeSpike , Project Notes,,")
+    assert _allowed_notebooks() == {"ClaudeSpike", "Project Notes"}
+
+
+@pytest.mark.parametrize("value", ["${user_config.allowed_notebooks}", "ClaudeSpike, ${EXTRA}"])
+def test_allowed_notebooks_unexpanded_placeholder_is_config_error(monkeypatch, value):
+    monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", value)
+    with pytest.raises(OneNoteError) as exc:
+        _allowed_notebooks()
+    assert exc.value.code == "config_error"
+    assert repr(value) in str(exc.value)
+
+
+@pytest.mark.parametrize("value", [None, "", "ClaudeSpike", "Budget $5"])
+def test_allowlist_config_error_none_without_placeholder(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("ONENOTE_ALLOWED_NOTEBOOKS", raising=False)
+    else:
+        monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", value)
+    assert allowlist_config_error() is None
+
+
+def test_allowlist_config_error_names_variable_and_value(monkeypatch):
+    monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", "${user_config.allowed_notebooks}")
+    message = allowlist_config_error()
+    assert message is not None
+    assert "ONENOTE_ALLOWED_NOTEBOOKS" in message
+    assert "'${user_config.allowed_notebooks}'" in message
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +119,8 @@ _HIERARCHY_XML = (
     '  </one:Section>'
     '</one:Notebook>'
     '<one:Notebook ID="nb-secret" name="Private">'
-    '  <one:Section ID="sec-secret" name="Geheim">'
-    '    <one:Page ID="page-secret" name="Tagebuch"/>'
+    '  <one:Section ID="sec-secret" name="Secret">'
+    '    <one:Page ID="page-secret" name="Diary"/>'
     '  </one:Section>'
     '</one:Notebook>'
     '</one:Notebooks>'
@@ -110,7 +138,20 @@ def test_filter_notebooks_drops_disallowed(monkeypatch):
     root = ET.fromstring(out)
     names = [nb.get("name") for nb in root.findall(f"{{{_ONE_NS}}}Notebook")]
     assert names == ["ClaudeSpike"]
-    assert "Tagebuch" not in out
+    assert "Diary" not in out
+
+
+def test_filter_notebooks_empty_allowlist_hides_all(monkeypatch):
+    monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", "")
+    root = ET.fromstring(_filter_notebooks_xml(_HIERARCHY_XML))
+    assert root.findall(f"{{{_ONE_NS}}}Notebook") == []
+
+
+def test_filter_notebooks_placeholder_raises_config_error(monkeypatch):
+    monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", "${user_config.allowed_notebooks}")
+    with pytest.raises(OneNoteError) as exc:
+        _filter_notebooks_xml(_HIERARCHY_XML)
+    assert exc.value.code == "config_error"
 
 
 # ---------------------------------------------------------------------------
@@ -167,3 +208,21 @@ def test_ensure_allowed_rejects_unknown_id(monkeypatch):
         _ensure_allowed(app, "page-nonexistent", "Page")
     assert exc.value.code == "bad_request"
     assert "not found" in str(exc.value)
+
+
+def test_ensure_allowed_empty_allowlist_rejects_everything(monkeypatch):
+    monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", "")
+    app = _FakeApp(_HIERARCHY_XML)
+    for object_id, kind in [("page-allowed", "Page"), ("sec-allowed", "Section")]:
+        with pytest.raises(OneNoteError) as exc:
+            _ensure_allowed(app, object_id, kind)
+        assert exc.value.code == "bad_request"
+
+
+def test_ensure_allowed_placeholder_raises_config_error_without_com(monkeypatch):
+    monkeypatch.setenv("ONENOTE_ALLOWED_NOTEBOOKS", "${user_config.allowed_notebooks}")
+    app = _FakeApp(_HIERARCHY_XML)
+    with pytest.raises(OneNoteError) as exc:
+        _ensure_allowed(app, "page-allowed", "Page")
+    assert exc.value.code == "config_error"
+    assert app.calls == 0
