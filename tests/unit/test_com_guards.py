@@ -165,7 +165,8 @@ class _FakeApp:
         self._xml = xml
         self.calls = 0
 
-    def GetHierarchy(self, anchor: str, scope: int) -> str:
+    def GetHierarchy(self, anchor: str, scope: int, xs_schema: int) -> str:
+        assert xs_schema == com.XS2013
         self.calls += 1
         return self._xml
 

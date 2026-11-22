@@ -56,6 +56,10 @@ from onenote_mcp.images import pixel_size
 _ONE_NS = "http://schemas.microsoft.com/office/onenote/2013/onenote"
 ET.register_namespace("one", _ONE_NS)
 
+# XMLSchema.xs2013, passed explicitly on every XML call: the COM default is
+# xsCurrent, which newer OneNote builds moved to a 2026 namespace.
+XS2013 = 2
+
 _MCPREF_PREFIX = "mcpref:"
 
 # Process-lifetime caches.
@@ -505,7 +509,7 @@ def _ensure_allowed(app, object_id: str, kind: str) -> None:
     allowed = _allowed_notebooks()
     if allowed is None:
         return
-    root = ET.fromstring(app.GetHierarchy("", 4))  # scope 4 = full tree
+    root = ET.fromstring(app.GetHierarchy("", 4, XS2013))  # scope 4 = full tree
     target = next((el for el in root.iter() if el.get("ID") == object_id), None)
     if target is None:
         raise OneNoteError(
@@ -534,26 +538,26 @@ def _list_hierarchy_impl() -> str:
     app = _app()
     # scope 4 = hsChildren: one call returns the full tree
     # out-param pbstrHierarchyXmlOut is returned as the Python return value
-    return _filter_notebooks_xml(app.GetHierarchy("", 4))
+    return _filter_notebooks_xml(app.GetHierarchy("", 4, XS2013))
 
 
 def _ping_impl() -> str:
     """Lightweight liveness probe: notebooks only (scope 0 = hsSelf)."""
     app = _app()
-    return app.GetHierarchy("", 0)
+    return app.GetHierarchy("", 0, XS2013)
 
 
 def _list_sections_impl() -> str:
     app = _app()
     # scope 3 = hsSections: notebooks + their sections, WITHOUT pages.
-    return _filter_notebooks_xml(app.GetHierarchy("", 3))
+    return _filter_notebooks_xml(app.GetHierarchy("", 3, XS2013))
 
 
 def _list_pages_impl(section_id: str) -> str:
     app = _app()
     _ensure_allowed(app, section_id, "Section")
     # scope 4 anchored on a section returns just that section's pages.
-    return app.GetHierarchy(section_id, 4)
+    return app.GetHierarchy(section_id, 4, XS2013)
 
 
 def _get_page_impl(page_id: str, include_binary: bool = False) -> str:
@@ -561,10 +565,10 @@ def _get_page_impl(page_id: str, include_binary: bool = False) -> str:
     _ensure_allowed(app, page_id, "Page")
     if include_binary:
         # pageInfo=1 = piBinaryData: embeds image bytes as base64 in <one:Data>
-        xml = app.GetPageContent(page_id, 1)
+        xml = app.GetPageContent(page_id, 1, XS2013)
         return _strip_data_to_mcpref(xml)
     # pageInfo=0 = piBasic: no binary; images come back as <one:CallbackID>.
-    xml = app.GetPageContent(page_id, 0)
+    xml = app.GetPageContent(page_id, 0, XS2013)
     return _strip_callbacks_to_mcpref(xml, page_id)
 
 
@@ -654,7 +658,7 @@ def _replace_page_impl(page_id: str, page_xml: str, keep_tags: frozenset[str]) -
     app = _app()
     _ensure_allowed(app, page_id, "Page")
 
-    current_xml = app.GetPageContent(page_id, 0)
+    current_xml = app.GetPageContent(page_id, 0, XS2013)
     current_root = ET.fromstring(current_xml)
 
     # --- prepare write XML (before any deletion) ---
@@ -687,7 +691,7 @@ def _replace_page_impl(page_id: str, page_xml: str, keep_tags: frozenset[str]) -
     # Written even after failed deletions: stopping here would leave a page
     # with part of its old content and none of the new.
     # Pass 0.0 for dateExpectedLastModified (OLE date epoch = no conflict check)
-    app.UpdatePageContent(serialized, 0.0)
+    app.UpdatePageContent(serialized, 0.0, XS2013)
     if failures:
         raise _partial_write_error(failures)
 
@@ -731,7 +735,7 @@ def _plan_subpage_order(
 def _place_as_subpage(app, section_id: str, new_page_id: str, parent_page_id: str) -> None:
     """Reposition *new_page_id* as a sub-page of *parent_page_id* via UpdateHierarchy."""
     page_tag = f"{{{_ONE_NS}}}Page"
-    section_xml = app.GetHierarchy(section_id, 4)  # scope 4 = pages
+    section_xml = app.GetHierarchy(section_id, 4, XS2013)  # scope 4 = pages
     src = ET.fromstring(section_xml)
     pages = [p for p in src.iter(page_tag) if p.get("ID")]
     page_ids = [p.get("ID") for p in pages]
@@ -745,7 +749,7 @@ def _place_as_subpage(app, section_id: str, new_page_id: str, parent_page_id: st
         page_el = ET.SubElement(section_el, page_tag)
         page_el.set("ID", pid)
         page_el.set("pageLevel", levels[pid])
-    app.UpdateHierarchy(ET.tostring(section_el, encoding="unicode", xml_declaration=False))
+    app.UpdateHierarchy(ET.tostring(section_el, encoding="unicode", xml_declaration=False), XS2013)
 
 
 def _create_page_impl(
@@ -758,7 +762,7 @@ def _create_page_impl(
     if parent_page_id is not None:
         # Validate the parent exists BEFORE creating anything, so a bad parent
         # does not leave an orphan page behind.
-        existing = ET.fromstring(app.GetHierarchy(section_id, 4))
+        existing = ET.fromstring(app.GetHierarchy(section_id, 4, XS2013))
         page_tag = f"{{{_ONE_NS}}}Page"
         if not any(p.get("ID") == parent_page_id for p in existing.iter(page_tag)):
             raise OneNoteError(
@@ -779,7 +783,7 @@ def _create_page_impl(
         # OneNote reads <one:T> content as HTML.
         t_el.text = html.escape(title, quote=False)
         title_xml = ET.tostring(page_el, encoding="unicode", xml_declaration=False)
-        app.UpdatePageContent(title_xml, 0.0)
+        app.UpdatePageContent(title_xml, 0.0, XS2013)
     if parent_page_id is not None:
         # CreateNewPage appends at the end of the section; reorder + indent so the
         # page becomes the LAST sub-page under the requested parent.
@@ -802,7 +806,7 @@ def _append_page_impl(page_id: str, content_xml: str) -> None:
     page_el.set("ID", page_id)
     serialized = ET.tostring(page_el, encoding="unicode", xml_declaration=False)
     serialized = _complete_image_sizes(_resolve_mcpref_to_data(serialized, app))
-    app.UpdatePageContent(serialized, 0.0)
+    app.UpdatePageContent(serialized, 0.0, XS2013)
 
 
 # ---- Public API -------------------------------------------------------------

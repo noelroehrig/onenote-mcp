@@ -30,7 +30,8 @@ class _FakeApp:
     def CreateNewPage(self, section_id: str) -> str:
         return "{NEW-PAGE}"
 
-    def UpdatePageContent(self, xml: str, date_expected_last_modified: float) -> None:
+    def UpdatePageContent(self, xml: str, date_expected_last_modified: float, xs_schema: int) -> None:
+        assert xs_schema == com.XS2013
         self.updates.append(xml)
 
 

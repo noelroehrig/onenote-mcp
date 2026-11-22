@@ -69,7 +69,7 @@ def _summarize(page_id: str) -> None:
     try:
         app = com._app()
         t0 = time.perf_counter()
-        full_xml = app.GetPageContent(page_id, 1)
+        full_xml = app.GetPageContent(page_id, 1, com.XS2013)
         elapsed_full = time.perf_counter() - t0
     finally:
         comtypes.CoUninitialize()
@@ -83,7 +83,7 @@ def _summarize(page_id: str) -> None:
     try:
         app = com._app()
         t0 = time.perf_counter()
-        basic_xml = app.GetPageContent(page_id, 0)
+        basic_xml = app.GetPageContent(page_id, 0, com.XS2013)
         elapsed_basic = time.perf_counter() - t0
     finally:
         comtypes.CoUninitialize()

@@ -68,7 +68,8 @@ class _FakeApp:
     def __init__(self) -> None:
         self.updates: list[str] = []
 
-    def UpdatePageContent(self, xml: str, date_expected_last_modified: float) -> None:
+    def UpdatePageContent(self, xml: str, date_expected_last_modified: float, xs_schema: int) -> None:
+        assert xs_schema == com.XS2013
         self.updates.append(xml)
 
 
@@ -142,7 +143,8 @@ class _FakeReplaceApp:
         self.calls: list[tuple[str, str]] = []
         self._undeletable = undeletable
 
-    def GetPageContent(self, page_id: str, page_info: int) -> str:
+    def GetPageContent(self, page_id: str, page_info: int, xs_schema: int) -> str:
+        assert xs_schema == com.XS2013
         return _CURRENT_PAGE
 
     def DeletePageContent(self, page_id: str, object_id: str, date_expected_last_modified: float) -> None:
@@ -150,7 +152,8 @@ class _FakeReplaceApp:
         if object_id in self._undeletable:
             raise comtypes.COMError(_HRESULT, "locked", None)
 
-    def UpdatePageContent(self, xml: str, date_expected_last_modified: float) -> None:
+    def UpdatePageContent(self, xml: str, date_expected_last_modified: float, xs_schema: int) -> None:
+        assert xs_schema == com.XS2013
         self.calls.append(("update", xml))
 
 
